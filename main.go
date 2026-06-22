@@ -71,6 +71,10 @@ func main() {
 		err = cmdSecretsPull(parseFlags(os.Args[3:]))
 	case "exec":
 		err = cmdExec(os.Args[2:])
+	case "setup":
+		err = cmdSetup(parseFlags(os.Args[2:]))
+	case "ssh-agent":
+		err = cmdSSHAgent(parseFlags(os.Args[2:]))
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -471,6 +475,15 @@ USAGE
         Unseal this machine's granted secrets, print KEY=VALUE.
   p3sig exec          --url URL --machine ID --key FILE [--bundle NAME] -- CMD [args...]
         Inject those secrets into CMD's environment and run it.
+
+  p3sig setup         [--label NAME] [--show] [--delete]
+        Create a chip-backed SSH client key (TPM / Secure Enclave, gated by
+        Windows Hello / Touch ID) and print its OpenSSH public key. --show prints
+        an existing key; --delete removes it. Default label "p3sig".
+  p3sig ssh-agent     [--label NAME] [--bind PATH]
+        Run an ssh-agent serving the chip key; ssh signs through it, tapping the
+        biometric per connection. --bind is a unix socket path (macOS/Linux) or a
+        named pipe (Windows; default \\.\pipe\openssh-ssh-agent).
 
 DEFAULTS
   --out defaults to /etc/p3sig/ssh

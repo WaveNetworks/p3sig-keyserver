@@ -1,4 +1,6 @@
 /p3sig
+/p3sig.exe
+/p3sig-*
 /dist/
 *.key
 kg.txt
