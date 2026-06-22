@@ -1,8 +1,4 @@
-p3sig-agent
-p3sig-agent-linux-amd64
-p3sig-agent-linux-arm64
-p3sig-agent-darwin-amd64
-p3sig-agent-darwin-arm64
-p3sig-agent-windows-amd64.exe
-*.pem
+/p3sig
+/dist/
 *.key
+kg.txt

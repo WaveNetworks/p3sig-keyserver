@@ -1,144 +1,64 @@
-# p3sig-agent
+# p3sig agent
 
-A small, dependency-minimal Go binary for machines that need to authenticate with [P3sig](https://p3sig.com).
+One Go binary, two roles, for [p3sig.com](https://p3sig.com) (zero-knowledge vault + SSH certificate authority).
 
-**Inspect this code.** It handles private keys and decrypts secrets locally — you should verify it does exactly what it says before running it on your servers.
+**Inspect this code.** It handles private keys and decrypts secrets locally — verify it does exactly what it says before running it on your servers.
 
----
+- **On a server** you SSH *to* / that needs secrets: materialize the sshd trust files
+  (`TrustedUserCAKeys`, `AuthorizedPrincipalsFile`, `RevokedKeys`) and inject sealed secrets.
+- **Identity:** every machine has an Ed25519 keypair; p3sig holds only the public half.
+  Auth is a stateless **signed request** — an Ed25519 signature over `"<machine_id>|<unix_ts>"`.
+  No challenge round-trip, no token. Everything pulled is either public (CA keys, principals,
+  KRL) or sealed ciphertext opened locally, so the transport carries nothing secret.
 
-## What it does
+## Install
 
-`p3sig-agent` authenticates a machine identity to P3sig using Ed25519 challenge-response, then either:
+Download the binary for your platform from the [latest release](../../releases/latest), then:
 
-- **`vault get`** — retrieves an encrypted API key from the P3sig vault and decrypts it locally (the server never sees the plaintext)
-- **`ssh-keys`** — fetches the `authorized_keys` list for this machine identity, for use with sshd's `AuthorizedKeysCommand`
-
-No secrets are sent to the server. The private key stays on disk. The vault key is decrypted in memory and printed to stdout.
-
----
-
-## How it works
-
-### Authentication
-
-1. Agent calls `POST /v1/auth/challenge` with its identity ID
-2. Server returns a random 32-byte hex challenge (valid 30 seconds, single-use)
-3. Agent signs the raw challenge bytes with its Ed25519 private key
-4. Server verifies the signature against the registered public key → issues a short-lived JWT
-
-### E2E vault decryption
-
-When a vault entry has an E2E copy, the server returns a `sodium_crypto_box_seal` ciphertext sealed to the identity's public key. The agent:
-
-1. Converts the Ed25519 key pair to Curve25519 (X25519) via the standard birational map
-2. Opens the sealed box with `nacl/box.OpenAnonymous` (wire-compatible with libsodium)
-3. Prints the plaintext API key to stdout — the server never held the decryption key
-
-### SSH authorized_keys
-
-Agent authenticates, calls `POST /v1/ssh/authorized-keys`, and prints the OpenSSH-format public keys for this machine identity to stdout. Pair with sshd's `AuthorizedKeysCommand` to pull access keys centrally without editing files on each machine.
-
----
-
-## Usage
-
-```
-p3sig-agent vault get  --api URL --identity ID --key PATH --label LABEL
-p3sig-agent vault get  --api URL --identity ID --key PATH --scope SCOPE
-p3sig-agent vault get  --api URL --identity ID --key PATH --vault-id ID
-p3sig-agent ssh-keys   --api URL --identity ID --key PATH
+```sh
+chmod +x p3sig-<os>-<arch> && sudo mv p3sig-<os>-<arch> /usr/local/bin/p3sig
 ```
 
-**Flags:**
+(Windows: rename `p3sig-windows-amd64.exe` to `p3sig.exe`.)
 
-| Flag | Description |
-|------|-------------|
-| `--api` | P3sig API URL, e.g. `https://p3sig.com/p3sig/api/index.php` |
-| `--identity` | Your P3sig identity ID (shown in the dashboard) |
-| `--key` | Path to your Ed25519 private key PEM (PKCS#8) |
-| `--label` | Vault entry label (for `vault get`) |
-| `--scope` | Vault scope pattern (for `vault get`) |
-| `--vault-id` | Vault entry ID (for `vault get`) |
+## Quick start (a server that trusts p3sig-issued certificates)
 
----
+```sh
+# 1. give this machine an identity, register the printed PUBLIC key in p3sig (Machines)
+p3sig keygen --out /etc/p3sig/machine.key
 
-## Key generation
+# 2. pull the trust files
+p3sig agent pull --url https://p3sig.com/p3sig/api/index.php \
+                 --machine <machine-id> --key /etc/p3sig/machine.key --out /etc/p3sig/ssh
 
-```bash
-# Generate private key
-openssl genpkey -algorithm ed25519 -out /etc/p3sig/identity.pem
-
-# Show public key to paste into P3sig dashboard
-openssl pkey -in /etc/p3sig/identity.pem -pubout
+# 3. wire sshd (prints the lines), then reload sshd
+p3sig agent install --out /etc/p3sig/ssh
 ```
 
-Protect the private key file:
+Keep the files fresh with `p3sig agent run … --interval 300` (a systemd service/timer).
 
-```bash
-chmod 600 /etc/p3sig/identity.pem
-chown nobody:nobody /etc/p3sig/identity.pem   # match AuthorizedKeysCommandUser
-```
+## Commands
 
----
+| Command | Purpose |
+|---|---|
+| `p3sig keygen [--out FILE]` | Generate the machine identity; print the public key to register |
+| `p3sig agent pull --url --machine --key [--out]` | Write `TrustedUserCAKeys` / `AuthorizedPrincipalsFile/<user>` / `RevokedKeys` |
+| `p3sig agent run … [--interval SEC]` | Loop `pull` (default 300s) |
+| `p3sig agent install [--out]` | Print the `sshd_config` lines |
+| `p3sig secrets pull --url --machine --key [--bundle]` | Unseal granted secrets → `KEY=VALUE` |
+| `p3sig exec … -- CMD [args]` | Inject those secrets into `CMD`'s environment and run it |
 
-## SSH setup (sshd)
-
-Add to `/etc/ssh/sshd_config`:
-
-```
-AuthorizedKeysCommand /usr/local/bin/p3sig-agent ssh-keys \
-    --api https://p3sig.com/p3sig/api/index.php \
-    --identity <your-identity-id> \
-    --key /etc/p3sig/identity.pem
-AuthorizedKeysCommandUser nobody
-```
-
-Then restart sshd:
-
-```bash
-systemctl restart sshd
-```
-
-Manage which SSH public keys have access to this machine from the P3sig dashboard — no more editing `authorized_keys` files by hand.
-
----
+`--out` defaults to `/etc/p3sig/ssh`. KRL compilation shells out to `ssh-keygen` (already
+present wherever OpenSSH is).
 
 ## Build
 
-Requires Go 1.21+.
-
-```bash
-go mod tidy
-go build -o p3sig-agent .
-
-# Cross-compile for Linux
-GOOS=linux GOARCH=amd64 go build -o p3sig-agent-linux-amd64 .
-GOOS=linux GOARCH=arm64 go build -o p3sig-agent-linux-arm64 .
+```sh
+go build -o p3sig .
+# cross-compile, e.g. macOS arm64 / Windows:
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o p3sig-darwin-arm64 .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o p3sig-windows-amd64.exe .
 ```
 
----
-
-## Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| [`filippo.io/edwards25519`](https://pkg.go.dev/filippo.io/edwards25519) | Ed25519 → Curve25519 public key conversion |
-| [`golang.org/x/crypto/nacl/box`](https://pkg.go.dev/golang.org/x/crypto/nacl/box) | NaCl sealed box decryption (libsodium-compatible) |
-
-Standard library only beyond those two. No network clients, no config parsers, no frameworks.
-
----
-
-## Security notes
-
-- The private key is read from disk once at startup and used only to sign the challenge and derive the X25519 decryption key
-- Vault plaintext is printed to stdout and never written to disk by this binary
-- The JWT is held in memory for the duration of a single invocation and then discarded
-- If the P3sig server is compromised, it can return a crafted ciphertext — but it still cannot decrypt vault entries sealed with your key
-- Revoke the identity in the P3sig dashboard to immediately cut off all access
-
----
-
-## License
-
-MIT
+Pure Go (no cgo) — the chip-backed client keys (Secure Enclave / TPM, behind Touch ID /
+Windows Hello) are a planned per-OS addition that will link the platform keystore.

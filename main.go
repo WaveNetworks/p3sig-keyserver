@@ -1,296 +1,386 @@
-// p3sig-agent — P3sig identity agent
+// Command p3sig is the v2 agent for p3sig.com (zero-knowledge vault + SSH CA).
 //
-// Authenticates a machine identity to p3sig.com using Ed25519 challenge-response,
-// then either retrieves a vault API key (decrypting E2E sealed boxes locally)
-// or fetches SSH authorized_keys for the machine.
+// One binary, two roles:
 //
-// Usage:
+//   server role — on a machine you SSH TO / that needs secrets:
+//     p3sig agent pull|run|install   materialize sshd trust files (TrustedUserCAKeys,
+//                                    AuthorizedPrincipalsFile, RevokedKeys/KRL)
+//     p3sig secrets pull             unseal this machine's granted secrets
+//     p3sig exec -- CMD              inject secrets into a process's environment
 //
-//	p3sig-agent vault get  --api URL --identity ID --key PATH --label LABEL
-//	p3sig-agent vault get  --api URL --identity ID --key PATH --scope SCOPE
-//	p3sig-agent vault get  --api URL --identity ID --key PATH --vault-id ID
-//	p3sig-agent ssh-keys   --api URL --identity ID --key PATH
-//
-// Flags:
-//
-//	--api          P3sig API base URL (e.g. https://p3sig.com/p3sig/api/index.php)
-//	--identity     P3sig identity ID
-//	--key          Path to Ed25519 private key PEM (PKCS#8, from openssl genpkey)
-//	--label        Vault entry label (for vault get)
-//	--scope        Vault scope pattern (for vault get)
-//	--vault-id     Vault entry ID (for vault get)
-//
-// Key generation:
-//
-//	openssl genpkey -algorithm ed25519 -out /etc/p3sig/identity.pem
-//	openssl pkey -in /etc/p3sig/identity.pem -pubout   # shows public key to register in p3sig
-//
-// sshd integration (put in /etc/ssh/sshd_config):
-//
-//	AuthorizedKeysCommand /usr/local/bin/p3sig-agent ssh-keys --api URL --identity ID --key /etc/p3sig/identity.pem
-//	AuthorizedKeysCommandUser nobody
-
+//   identity — every machine has an Ed25519 keypair; p3sig holds only the public
+//   half. Auth is a stateless signed request: Ed25519 signature over
+//   "<machine_id>|<unix_ts>" (no challenge round-trip, no token). Everything the
+//   agent pulls is either public (CA keys, principals, KRL) or sealed ciphertext
+//   it opens locally — so a compromised transport leaks nothing.
 package main
 
 import (
 	"crypto/ed25519"
 	"crypto/sha512"
-	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"filippo.io/edwards25519"
 	"golang.org/x/crypto/nacl/box"
 )
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-type apiResponse struct {
-	Error   string          `json:"error"`
-	Success string          `json:"success"`
-	Info    string          `json:"info"`
-	Warning string          `json:"warning"`
-	Results json.RawMessage `json:"results"`
-}
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
+const httpTimeout = 20 * time.Second
 
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
 	}
-
-	cmd := os.Args[1]
-	if cmd == "-h" || cmd == "--help" || cmd == "help" {
-		usage()
-		os.Exit(0)
-	}
-
-	flags := parseFlags(os.Args[2:])
-
-	apiBase     := flags["api"]
-	identityID  := flags["identity"]
-	keyPath     := flags["key"]
-
-	if apiBase == "" || identityID == "" || keyPath == "" {
-		fmt.Fprintln(os.Stderr, "error: --api, --identity, and --key are required")
-		os.Exit(1)
-	}
-
-	privKey, err := loadEd25519Key(keyPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error loading key: %v\n", err)
-		os.Exit(1)
-	}
-
-	token, err := authenticate(apiBase, identityID, privKey)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "authentication failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	switch cmd {
-	case "vault":
-		if len(os.Args) < 3 || os.Args[2] != "get" {
-			fmt.Fprintln(os.Stderr, "usage: p3sig-agent vault get [--label LABEL | --scope SCOPE | --vault-id ID]")
-			os.Exit(1)
+	var err error
+	switch os.Args[1] {
+	case "keygen":
+		err = cmdKeygen(parseFlags(os.Args[2:]))
+	case "agent":
+		if len(os.Args) < 3 {
+			err = fmt.Errorf("agent needs a subcommand: pull | run | install")
+			break
 		}
-		err = cmdVaultGet(apiBase, identityID, token, privKey, flags["vault-id"], flags["label"], flags["scope"])
-
-	case "ssh-keys":
-		err = cmdSSHKeys(apiBase, token)
-
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
+		f := parseFlags(os.Args[3:])
+		switch os.Args[2] {
+		case "pull":
+			err = cmdAgentPull(f)
+		case "run":
+			err = cmdAgentRun(f)
+		case "install":
+			err = cmdAgentInstall(f)
+		default:
+			err = fmt.Errorf("unknown agent subcommand %q", os.Args[2])
+		}
+	case "secrets":
+		if len(os.Args) < 3 || os.Args[2] != "pull" {
+			err = fmt.Errorf("usage: p3sig secrets pull --url URL --machine ID --key FILE [--bundle NAME]")
+			break
+		}
+		err = cmdSecretsPull(parseFlags(os.Args[3:]))
+	case "exec":
+		err = cmdExec(os.Args[2:])
+	case "help", "-h", "--help":
 		usage()
-		os.Exit(1)
+	default:
+		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
-
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-// ─── Commands ─────────────────────────────────────────────────────────────────
+// ─── keygen ─────────────────────────────────────────────────────────────────
 
-// cmdVaultGet authenticates, retrieves the vault entry, decrypts if E2E, and
-// prints the plaintext API key to stdout.
-func cmdVaultGet(apiBase, identityID, token string, privKey ed25519.PrivateKey, vaultID, label, scope string) error {
-	params := url.Values{}
-	switch {
-	case vaultID != "":
-		params.Set("vault_id", vaultID)
-	case label != "":
-		params.Set("label", label)
-		params.Set("identity_id", identityID)
-	case scope != "":
-		params.Set("scope", scope)
-	default:
-		return fmt.Errorf("provide --vault-id, --label, or --scope")
-	}
-
-	resp, err := apiPost(apiBase, "retrieveKey", params, token)
+func cmdKeygen(f map[string]string) error {
+	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		return err
 	}
-
-	var result struct {
-		APIKey       string `json:"api_key"`
-		EncryptedKey string `json:"encrypted_key"`
-		E2E          bool   `json:"e2e"`
+	out := f["out"]
+	if out == "" {
+		out = "p3sig-machine.key"
 	}
-	if err := json.Unmarshal(resp.Results, &result); err != nil {
-		return fmt.Errorf("parse result: %w", err)
+	// Store the 64-byte private key base64 — the same encoding p3sig and the
+	// reference shim use, so keys are interchangeable.
+	if err := os.WriteFile(out, []byte(base64.StdEncoding.EncodeToString(priv)+"\n"), 0o600); err != nil {
+		return err
+	}
+	fmt.Printf("machine key written to %s (keep it secret, mode 600)\n", out)
+	fmt.Printf("register this PUBLIC key for the machine in p3sig:\n\n%s\n", base64.StdEncoding.EncodeToString(pub))
+	return nil
+}
+
+// ─── agent: materialize sshd trust files ────────────────────────────────────
+
+func cmdAgentPull(f map[string]string) error {
+	apiBase, machine, key, outDir, err := agentArgs(f)
+	if err != nil {
+		return err
+	}
+	return agentPull(apiBase, machine, key, outDir)
+}
+
+func agentPull(apiBase, machine string, key ed25519.PrivateKey, outDir string) error {
+	if err := os.MkdirAll(filepath.Join(outDir, "principals"), 0o755); err != nil {
+		return err
 	}
 
-	if result.E2E {
-		// Decrypt sealed box locally — server never had the plaintext
-		plaintext, err := openSealedBox(result.EncryptedKey, privKey)
-		if err != nil {
-			return fmt.Errorf("decrypt: %w", err)
+	// 1. TrustedUserCAKeys
+	var ca struct {
+		Keys  string `json:"trusted_user_ca_keys"`
+		Count int    `json:"count"`
+	}
+	if err := pullInto(apiBase, "getTrustedCA", machine, key, nil, &ca); err != nil {
+		return fmt.Errorf("getTrustedCA: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "trusted_user_ca_keys"), []byte(ca.Keys+"\n"), 0o644); err != nil {
+		return err
+	}
+
+	// 2. AuthorizedPrincipalsFile — one file per login user
+	var pr struct {
+		Grants []struct {
+			Principal string `json:"principal"`
+			LoginUser string `json:"login_user"`
+		} `json:"grants"`
+	}
+	if err := pullInto(apiBase, "getPrincipals", machine, key, nil, &pr); err != nil {
+		return fmt.Errorf("getPrincipals: %w", err)
+	}
+	byUser := map[string]map[string]bool{}
+	for _, g := range pr.Grants {
+		if byUser[g.LoginUser] == nil {
+			byUser[g.LoginUser] = map[string]bool{}
 		}
-		fmt.Print(plaintext)
-	} else {
-		// Legacy: server decrypted — no E2E copy exists yet for this entry
-		fmt.Print(result.APIKey)
+		byUser[g.LoginUser][g.Principal] = true
+	}
+	for user, set := range byUser {
+		if !safeUser(user) {
+			continue // never let a server value escape the principals dir
+		}
+		names := make([]string, 0, len(set))
+		for p := range set {
+			names = append(names, p)
+		}
+		sort.Strings(names)
+		path := filepath.Join(outDir, "principals", user)
+		if err := os.WriteFile(path, []byte(strings.Join(names, "\n")+"\n"), 0o644); err != nil {
+			return err
+		}
 	}
 
+	// 3. RevokedKeys (KRL) — compile the spec with ssh-keygen
+	var krl struct {
+		Spec  string `json:"krl_spec"`
+		Count int    `json:"count"`
+	}
+	if err := pullInto(apiBase, "getKRL", machine, key, nil, &krl); err != nil {
+		return fmt.Errorf("getKRL: %w", err)
+	}
+	specPath := filepath.Join(outDir, ".krl.spec")
+	if err := os.WriteFile(specPath, []byte(krl.Spec+"\n"), 0o600); err != nil {
+		return err
+	}
+	krlPath := filepath.Join(outDir, "revoked_keys")
+	if out, err := exec.Command("ssh-keygen", "-kq", "-f", krlPath, specPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("compile KRL (ssh-keygen): %v: %s", err, out)
+	}
+
+	fmt.Printf("pulled: %d CA(s), %d principal grant(s), %d revocation(s) → %s\n",
+		ca.Count, len(pr.Grants), krl.Count, outDir)
 	return nil
 }
 
-// cmdSSHKeys authenticates, fetches the authorized_keys list for this machine
-// identity, and prints it to stdout (for use with sshd AuthorizedKeysCommand).
-func cmdSSHKeys(apiBase, token string) error {
-	resp, err := apiPost(apiBase, "getAuthorizedKeys", url.Values{}, token)
+func cmdAgentRun(f map[string]string) error {
+	apiBase, machine, key, outDir, err := agentArgs(f)
 	if err != nil {
 		return err
 	}
-
-	var result struct {
-		AuthorizedKeys string `json:"authorized_keys"`
-		Count          int    `json:"count"`
+	interval := 300
+	if f["interval"] != "" {
+		if n, e := strconv.Atoi(f["interval"]); e == nil && n > 0 {
+			interval = n
+		}
 	}
-	if err := json.Unmarshal(resp.Results, &result); err != nil {
-		return fmt.Errorf("parse result: %w", err)
+	fmt.Printf("p3sig agent: refreshing %s every %ds\n", outDir, interval)
+	for {
+		if err := agentPull(apiBase, machine, key, outDir); err != nil {
+			fmt.Fprintln(os.Stderr, "pull failed:", err)
+		}
+		time.Sleep(time.Duration(interval) * time.Second)
 	}
+}
 
-	if result.AuthorizedKeys != "" {
-		fmt.Println(result.AuthorizedKeys)
+func cmdAgentInstall(f map[string]string) error {
+	_, _, _, outDir, err := agentArgs(f)
+	if err != nil {
+		return err
+	}
+	abs, _ := filepath.Abs(outDir)
+	fmt.Printf(`Add to /etc/ssh/sshd_config, then run `+"`p3sig agent run …`"+` (or a systemd timer)
+to keep these files fresh, and reload sshd:
+
+    TrustedUserCAKeys %s/trusted_user_ca_keys
+    AuthorizedPrincipalsFile %s/principals/%%u
+    RevokedKeys %s/revoked_keys
+
+`, abs, abs, abs)
+	return nil
+}
+
+// ─── secrets: unseal granted secrets ────────────────────────────────────────
+
+func cmdSecretsPull(f map[string]string) error {
+	apiBase, machine, key, _, err := agentArgs(f)
+	if err != nil && f["out"] == "" {
+		// out isn't required for secrets; only the first three are.
+		if apiBase == "" || machine == "" || key == nil {
+			return err
+		}
+	}
+	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"])
+	if err != nil {
+		return err
+	}
+	for _, kv := range pairs {
+		fmt.Printf("%s=%s\n", kv[0], kv[1])
 	}
 	return nil
 }
 
-// ─── Authentication ───────────────────────────────────────────────────────────
-
-func authenticate(apiBase, identityID string, privKey ed25519.PrivateKey) (string, error) {
-	// 1. Request challenge
-	resp, err := apiPost(apiBase, "requestChallenge", url.Values{"identity_id": {identityID}}, "")
+func cmdExec(args []string) error {
+	// p3sig exec --url … --machine … --key … [--bundle …] -- CMD args...
+	sep := -1
+	for i, a := range args {
+		if a == "--" {
+			sep = i
+			break
+		}
+	}
+	if sep < 0 || sep == len(args)-1 {
+		return fmt.Errorf("usage: p3sig exec --url URL --machine ID --key FILE [--bundle B] -- CMD [args...]")
+	}
+	f := parseFlags(args[:sep])
+	cmdArgs := args[sep+1:]
+	apiBase, machine, key := f["url"], f["machine"], (ed25519.PrivateKey)(nil)
+	k, err := loadKey(f["key"])
 	if err != nil {
-		return "", fmt.Errorf("challenge request: %w", err)
+		return err
 	}
-
-	var challengeResult struct {
-		ChallengeID  string `json:"challenge_id"`
-		ChallengeHex string `json:"challenge_hex"`
-	}
-	if err := json.Unmarshal(resp.Results, &challengeResult); err != nil {
-		return "", fmt.Errorf("parse challenge: %w", err)
-	}
-
-	// 2. Sign the challenge bytes with Ed25519 private key
-	challengeBytes, err := hex.DecodeString(challengeResult.ChallengeHex)
+	key = k
+	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"])
 	if err != nil {
-		return "", fmt.Errorf("decode challenge hex: %w", err)
+		return err
 	}
-
-	sig    := ed25519.Sign(privKey, challengeBytes)
-	sigB64 := base64.StdEncoding.EncodeToString(sig)
-
-	// 3. Submit signature → receive JWT
-	resp, err = apiPost(apiBase, "verifyChallenge", url.Values{
-		"identity_id":  {identityID},
-		"challenge_id": {challengeResult.ChallengeID},
-		"signature":    {sigB64},
-	}, "")
+	env := os.Environ()
+	for _, kv := range pairs {
+		env = append(env, kv[0]+"="+kv[1])
+	}
+	bin, err := exec.LookPath(cmdArgs[0])
 	if err != nil {
-		return "", fmt.Errorf("verify challenge: %w", err)
+		return err
 	}
-
-	var verifyResult struct {
-		Token string `json:"token"`
-	}
-	if err := json.Unmarshal(resp.Results, &verifyResult); err != nil {
-		return "", fmt.Errorf("parse token: %w", err)
-	}
-
-	if verifyResult.Token == "" {
-		return "", fmt.Errorf("empty token in response")
-	}
-
-	return verifyResult.Token, nil
+	c := exec.Command(bin, cmdArgs[1:]...)
+	c.Env, c.Stdin, c.Stdout, c.Stderr = env, os.Stdin, os.Stdout, os.Stderr
+	return c.Run()
 }
 
-// ─── Cryptography ─────────────────────────────────────────────────────────────
+func fetchSecrets(apiBase, machine string, key ed25519.PrivateKey, bundle string) ([][2]string, error) {
+	extra := url.Values{}
+	if bundle != "" {
+		extra.Set("bundle", bundle)
+	}
+	var res struct {
+		Secrets []struct {
+			Label     string `json:"label"`
+			Encrypted string `json:"encrypted_data"`
+		} `json:"secrets"`
+	}
+	if err := pullInto(apiBase, "getSealedSecrets", machine, key, extra, &res); err != nil {
+		return nil, err
+	}
+	out := make([][2]string, 0, len(res.Secrets))
+	for _, s := range res.Secrets {
+		val, err := openSealedBox(s.Encrypted, key)
+		if err != nil {
+			return nil, fmt.Errorf("unseal %s: %w", s.Label, err)
+		}
+		out = append(out, [2]string{s.Label, val})
+	}
+	return out, nil
+}
 
-// openSealedBox decrypts a base64-encoded sodium_crypto_box_seal ciphertext
-// using the Ed25519 private key (converted to X25519/Curve25519).
-// Wire-compatible with PHP's sodium_crypto_box_seal / sodium_crypto_box_seal_open.
+// ─── signed request transport (v2) ──────────────────────────────────────────
+
+type apiResponse struct {
+	Error   string          `json:"error"`
+	Results json.RawMessage `json:"results"`
+}
+
+// pullInto signs "<machine>|<ts>", POSTs the action, and unmarshals results into v.
+func pullInto(apiBase, action, machine string, key ed25519.PrivateKey, extra url.Values, v any) error {
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(key, []byte(machine+"|"+ts)))
+
+	form := url.Values{}
+	for k, vals := range extra {
+		form[k] = vals
+	}
+	form.Set("action", action)
+	form.Set("machine_id", machine)
+	form.Set("ts", ts)
+	form.Set("signature", sig)
+
+	client := &http.Client{Timeout: httpTimeout}
+	resp, err := client.Post(apiBase, "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	var ar apiResponse
+	if err := json.Unmarshal(body, &ar); err != nil {
+		return fmt.Errorf("invalid JSON (HTTP %d): %.200s", resp.StatusCode, body)
+	}
+	if ar.Error != "" {
+		return fmt.Errorf("%s", ar.Error)
+	}
+	if v != nil && len(ar.Results) > 0 {
+		return json.Unmarshal(ar.Results, v)
+	}
+	return nil
+}
+
+// ─── cryptography (kept from v1 — the zero-knowledge core) ───────────────────
+
+// openSealedBox decrypts a base64 sodium_crypto_box_seal ciphertext with the
+// Ed25519 private key (converted to X25519). Wire-compatible with PHP's
+// sodium_crypto_box_seal / Go's box.OpenAnonymous.
 func openSealedBox(encryptedB64 string, edPriv ed25519.PrivateKey) (string, error) {
 	ciphertext, err := base64.StdEncoding.DecodeString(encryptedB64)
 	if err != nil {
 		return "", fmt.Errorf("invalid base64: %w", err)
 	}
-
 	edPub := edPriv.Public().(ed25519.PublicKey)
-
 	x25519Pub, err := ed25519PubToX25519(edPub)
 	if err != nil {
 		return "", fmt.Errorf("public key conversion: %w", err)
 	}
-
 	x25519Priv := ed25519PrivToX25519(edPriv)
-
 	plaintext, ok := box.OpenAnonymous(nil, ciphertext, x25519Pub, x25519Priv)
 	if !ok {
 		return "", fmt.Errorf("decryption failed — wrong key or corrupted ciphertext")
 	}
-
 	return string(plaintext), nil
 }
 
-// ed25519PubToX25519 converts an Ed25519 public key to a Curve25519 (X25519)
-// public key via the birational map between Edwards25519 and Curve25519.
-// Compatible with sodium_crypto_sign_ed25519_pk_to_curve25519.
 func ed25519PubToX25519(edPub ed25519.PublicKey) (*[32]byte, error) {
-	p, err := new(edwardsPoint).SetBytes([]byte(edPub))
+	p, err := new(edwards25519.Point).SetBytes([]byte(edPub))
 	if err != nil {
 		return nil, fmt.Errorf("invalid Ed25519 public key: %w", err)
 	}
-	mont := p.BytesMontgomery()
 	var out [32]byte
-	copy(out[:], mont)
+	copy(out[:], p.BytesMontgomery())
 	return &out, nil
 }
 
-// edwardsPoint is an alias to avoid import collision in the function body.
-type edwardsPoint = edwards25519.Point
-
-// ed25519PrivToX25519 converts an Ed25519 private key to a Curve25519 (X25519)
-// scalar via SHA-512 and bit clamping.
-// Compatible with sodium_crypto_sign_ed25519_sk_to_curve25519.
 func ed25519PrivToX25519(edPriv ed25519.PrivateKey) *[32]byte {
-	// Ed25519 private key = seed (32 bytes) || public key (32 bytes)
-	// X25519 scalar = SHA-512(seed)[0:32] with clamping
 	h := sha512.Sum512(edPriv.Seed())
 	h[0] &= 248
 	h[31] &= 127
@@ -300,79 +390,58 @@ func ed25519PrivToX25519(edPriv ed25519.PrivateKey) *[32]byte {
 	return &out
 }
 
-// ─── Key Loading ──────────────────────────────────────────────────────────────
+// ─── helpers ────────────────────────────────────────────────────────────────
 
-// loadEd25519Key reads a PKCS#8 PEM file and returns an Ed25519 private key.
-// Generate with: openssl genpkey -algorithm ed25519 -out identity.pem
-func loadEd25519Key(path string) (ed25519.PrivateKey, error) {
+// loadKey reads a base64 (64-byte) Ed25519 private key written by `p3sig keygen`.
+func loadKey(path string) (ed25519.PrivateKey, error) {
+	if path == "" {
+		return nil, fmt.Errorf("--key is required")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("no PEM block found in %s", path)
-	}
-
-	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
 	if err != nil {
-		return nil, fmt.Errorf("parse private key: %w", err)
+		return nil, fmt.Errorf("key %s is not valid base64: %w", path, err)
 	}
-
-	edKey, ok := key.(ed25519.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("key in %s is not Ed25519 (got %T)", path, key)
+	if len(raw) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("key %s is %d bytes, want %d", path, len(raw), ed25519.PrivateKeySize)
 	}
-
-	return edKey, nil
+	return ed25519.PrivateKey(raw), nil
 }
 
-// ─── HTTP ─────────────────────────────────────────────────────────────────────
-
-func apiPost(apiBase, action string, params url.Values, token string) (*apiResponse, error) {
-	params.Set("action", action)
-
-	req, err := http.NewRequest("POST", apiBase, strings.NewReader(params.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+// agentArgs pulls the shared --url/--machine/--key/--out flags.
+func agentArgs(f map[string]string) (apiBase, machine string, key ed25519.PrivateKey, outDir string, err error) {
+	apiBase, machine, outDir = f["url"], f["machine"], f["out"]
+	if outDir == "" {
+		outDir = "/etc/p3sig/ssh"
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	if apiBase == "" || machine == "" {
+		return "", "", nil, "", fmt.Errorf("--url and --machine are required")
 	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("POST %s action=%s: %w", apiBase, action, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	var apiResp apiResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return nil, fmt.Errorf("invalid JSON response: %w (body: %.200s)", err, body)
-	}
-
-	if apiResp.Error != "" {
-		return nil, fmt.Errorf("%s", apiResp.Error)
-	}
-
-	return &apiResp, nil
+	key, err = loadKey(f["key"])
+	return apiBase, machine, key, outDir, err
 }
 
-// ─── CLI helpers ──────────────────────────────────────────────────────────────
+// safeUser rejects login names that could escape the principals directory.
+func safeUser(u string) bool {
+	if u == "" || len(u) > 64 {
+		return false
+	}
+	for _, r := range u {
+		if !(r == '_' || r == '-' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
 
 func parseFlags(args []string) map[string]string {
 	flags := make(map[string]string)
 	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if strings.HasPrefix(arg, "--") {
-			key := strings.TrimPrefix(arg, "--")
+		if strings.HasPrefix(args[i], "--") {
+			key := strings.TrimPrefix(args[i], "--")
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
 				flags[key] = args[i+1]
 				i++
@@ -385,34 +454,28 @@ func parseFlags(args []string) map[string]string {
 }
 
 func usage() {
-	fmt.Print(`p3sig-agent — P3sig identity agent
+	fmt.Print(`p3sig — agent for p3sig.com (zero-knowledge vault + SSH CA)
 
-USAGE:
-  p3sig-agent vault get  --api URL --identity ID --key PATH (--label L | --scope S | --vault-id V)
-  p3sig-agent ssh-keys   --api URL --identity ID --key PATH
+USAGE
+  p3sig keygen [--out FILE]
+        Generate this machine's Ed25519 identity; print its public key to register.
 
-FLAGS:
-  --api          P3sig API URL  (e.g. https://p3sig.com/p3sig/api/index.php)
-  --identity     P3sig identity ID
-  --key          Path to Ed25519 private key (PKCS#8 PEM)
-  --label        Vault entry label
-  --scope        Vault scope pattern
-  --vault-id     Vault entry ID
+  p3sig agent pull    --url URL --machine ID --key FILE [--out DIR]
+        Fetch + write TrustedUserCAKeys, AuthorizedPrincipalsFile/<user>, RevokedKeys.
+  p3sig agent run     --url URL --machine ID --key FILE [--out DIR] [--interval SEC]
+        Same, looping every --interval seconds (default 300).
+  p3sig agent install [--out DIR]
+        Print the sshd_config lines to add.
 
-KEY GENERATION:
-  openssl genpkey -algorithm ed25519 -out /etc/p3sig/identity.pem
-  openssl pkey -in /etc/p3sig/identity.pem -pubout   # paste public key into p3sig UI
+  p3sig secrets pull  --url URL --machine ID --key FILE [--bundle NAME]
+        Unseal this machine's granted secrets, print KEY=VALUE.
+  p3sig exec          --url URL --machine ID --key FILE [--bundle NAME] -- CMD [args...]
+        Inject those secrets into CMD's environment and run it.
 
-SSHD INTEGRATION (/etc/ssh/sshd_config):
-  AuthorizedKeysCommand /usr/local/bin/p3sig-agent ssh-keys \
-    --api https://p3sig.com/p3sig/api/index.php \
-    --identity <identity-id> --key /etc/p3sig/identity.pem
-  AuthorizedKeysCommandUser nobody
+DEFAULTS
+  --out defaults to /etc/p3sig/ssh
+  --url e.g. https://p3sig.com/p3sig/api/index.php
 
-BUILD:
-  cd scripts/p3sig-agent && go mod tidy && go build -o p3sig-agent .
-  # Cross-compile for Linux:
-  GOOS=linux GOARCH=amd64 go build -o p3sig-agent-linux-amd64 .
-  GOOS=linux GOARCH=arm64 go build -o p3sig-agent-linux-arm64 .
+Auth is a stateless signed request: Ed25519 over "<machine_id>|<unix_ts>".
 `)
 }
