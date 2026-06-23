@@ -9,13 +9,19 @@ package main
 import (
 	"bufio"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
+
+	"golang.org/x/crypto/nacl/box"
 )
 
 // ─── config + profiles ──────────────────────────────────────────────────────
@@ -29,9 +35,18 @@ type Profile struct {
 	Out     string `json:"out,omitempty"`
 }
 
+// Identity is the human/account side (Slice 2): a vault USB key that signs
+// management requests. The account is whoever owns that key — not typed.
+type Identity struct {
+	URL string `json:"url"`
+	Key string `json:"key"`
+}
+
 type Config struct {
-	DefaultProfile string             `json:"default_profile,omitempty"`
-	Profiles       map[string]Profile `json:"profiles"`
+	DefaultProfile  string              `json:"default_profile,omitempty"`
+	Profiles        map[string]Profile  `json:"profiles"`
+	DefaultIdentity string              `json:"default_identity,omitempty"`
+	Identities      map[string]Identity `json:"identities,omitempty"`
 }
 
 // configReadPaths is the lookup order for an existing config (first hit wins):
@@ -446,4 +461,231 @@ func short(s string) string {
 		return s
 	}
 	return s[:14] + "…"
+}
+
+// ─── Slice 2: account identity (USB-signs) ──────────────────────────────────
+
+// resolveIdentity returns the API URL + vault-key path for the human/account.
+// Precedence: flag > env > saved identity > default. The vault key is separate
+// from a machine key (P3SIG_VAULT_KEY, not P3SIG_KEY).
+func resolveIdentity(f map[string]string) (apiBase, keyPath string, err error) {
+	c, _ := loadConfig()
+	name := firstNonEmpty(f["identity"], os.Getenv("P3SIG_IDENTITY"), c.DefaultIdentity, "default")
+	id := c.Identities[name]
+	apiBase = firstNonEmpty(f["url"], os.Getenv("P3SIG_URL"), id.URL, defaultAPI)
+	keyPath = firstNonEmpty(f["key"], os.Getenv("P3SIG_VAULT_KEY"), id.Key)
+	if keyPath == "" {
+		return "", "", fmt.Errorf("no vault key — run `p3sig login --key <vault key file>`")
+	}
+	return apiBase, keyPath, nil
+}
+
+// userRequest signs "<pubkey>|<ts>" with the vault key and POSTs the action —
+// the account is resolved server-side from the key. Mirror of pullInto.
+func userRequest(apiBase, action, keyPath string, extra url.Values, v any) error {
+	key, err := loadKey(keyPath)
+	if err != nil {
+		return err
+	}
+	pub := base64.StdEncoding.EncodeToString(key.Public().(ed25519.PublicKey))
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(key, []byte(pub+"|"+ts)))
+
+	form := url.Values{}
+	for k, vals := range extra {
+		form[k] = vals
+	}
+	form.Set("action", action)
+	form.Set("pubkey", pub)
+	form.Set("ts", ts)
+	form.Set("signature", sig)
+	return postForm(apiBase, form, v)
+}
+
+// sealForKey seals plaintext to a base64 Ed25519 public key, producing a base64
+// libsodium sealed box (crypto_box_seal) — the inverse of openSealedBox, and
+// what p3sig stores. Wire-compatible with PHP's sodium_crypto_box_seal.
+func sealForKey(plaintext, edPubB64 string) (string, error) {
+	edPub, err := base64.StdEncoding.DecodeString(strings.TrimSpace(edPubB64))
+	if err != nil || len(edPub) != ed25519.PublicKeySize {
+		return "", fmt.Errorf("invalid recipient public key")
+	}
+	xPub, err := ed25519PubToX25519(ed25519.PublicKey(edPub))
+	if err != nil {
+		return "", err
+	}
+	sealed, err := box.SealAnonymous(nil, []byte(plaintext), xPub, rand.Reader)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+// ─── p3sig login — establish the account identity ───────────────────────────
+
+func cmdLogin(f map[string]string) error {
+	apiBase := firstNonEmpty(f["url"], os.Getenv("P3SIG_URL"), defaultAPI)
+	keyPath := firstNonEmpty(f["key"], os.Getenv("P3SIG_VAULT_KEY"))
+	if keyPath == "" {
+		return fmt.Errorf("usage: p3sig login --key <vault key file> [--url URL] [--identity NAME]\n" +
+			"(the vault key is the Ed25519 key registered to your p3sig account)")
+	}
+	var who struct {
+		UserID   string `json:"user_id"`
+		KeyLabel string `json:"key_label"`
+		KeyCount int    `json:"key_count"`
+	}
+	if err := userRequest(apiBase, "whoami", keyPath, nil, &who); err != nil {
+		return fmt.Errorf("%w\n(is this key registered as a vault key on your account?)", err)
+	}
+	label := who.KeyLabel
+	if label == "" {
+		label = "(unlabeled)"
+	}
+	fmt.Printf("Authenticated to p3sig.\n  account:  %s\n  via key:  %s  (%d key(s) on the account)\n\n",
+		who.UserID, label, who.KeyCount)
+
+	in := bufio.NewReader(os.Stdin)
+	name := ask(in, "Save this identity as", firstNonEmpty(f["identity"], "default"))
+
+	cfgPath := firstNonEmpty(os.Getenv("P3SIG_CONFIG"), userConfigPath())
+	cfg, _ := loadConfigFrom(cfgPath)
+	if cfg.Identities == nil {
+		cfg.Identities = map[string]Identity{}
+	}
+	cfg.Identities[name] = Identity{URL: apiBase, Key: keyPath}
+	if cfg.DefaultIdentity == "" {
+		cfg.DefaultIdentity = name
+	}
+	if err := saveConfigTo(cfgPath, cfg); err != nil {
+		return err
+	}
+	fmt.Printf("saved identity %q → %s\n", name, cfgPath)
+	fmt.Println("\nNow: p3sig secret set NAME   ·   p3sig secret get NAME")
+	return nil
+}
+
+// ─── p3sig secret … — zero-knowledge management ─────────────────────────────
+
+func cmdSecretSet(f map[string]string, name string) error {
+	if name == "" {
+		return fmt.Errorf("usage: p3sig secret set NAME [--type personal|developer] [--provider P] [--bundle ID]\n" +
+			"the value is read from stdin (echo -n VALUE | p3sig secret set NAME) or prompted")
+	}
+	apiBase, keyPath, err := resolveIdentity(f)
+	if err != nil {
+		return err
+	}
+	// 1. fetch the account's recipient keys
+	var mk struct {
+		Keys []struct {
+			KeyID string `json:"key_id"`
+			Pub   string `json:"public_key"`
+			Label string `json:"label"`
+		} `json:"keys"`
+	}
+	if err := userRequest(apiBase, "getMyVaultKeys", keyPath, nil, &mk); err != nil {
+		return err
+	}
+	if len(mk.Keys) == 0 {
+		return fmt.Errorf("no vault keys on this account to seal to")
+	}
+	// 2. read the value (never from argv)
+	value, err := readSecretValue(name)
+	if err != nil {
+		return err
+	}
+	// 3. seal to every recipient key, client-side
+	type copyT struct {
+		KeyID string `json:"key_id"`
+		Enc   string `json:"encrypted_data"`
+	}
+	copies := make([]copyT, 0, len(mk.Keys))
+	for _, k := range mk.Keys {
+		enc, err := sealForKey(value, k.Pub)
+		if err != nil {
+			return fmt.Errorf("seal to key %s: %w", k.Label, err)
+		}
+		copies = append(copies, copyT{KeyID: k.KeyID, Enc: enc})
+	}
+	payload, _ := json.Marshal(copies)
+	// 4. upload ciphertext only
+	extra := url.Values{}
+	extra.Set("label", name)
+	extra.Set("type", firstNonEmpty(f["type"], "developer"))
+	if f["provider"] != "" {
+		extra.Set("provider", f["provider"])
+	}
+	if f["bundle"] != "" {
+		extra.Set("bundle_id", f["bundle"])
+	}
+	extra.Set("sealed_copies", string(payload))
+	var res struct {
+		SecretID string `json:"secret_id"`
+		Sealed   int    `json:"sealed"`
+	}
+	if err := userRequest(apiBase, "saveSecretSealed", keyPath, extra, &res); err != nil {
+		return err
+	}
+	fmt.Printf("stored %q — sealed to %d key(s); the server holds only ciphertext.\n", name, res.Sealed)
+	return nil
+}
+
+func cmdSecretGetUser(f map[string]string, name string) error {
+	if name == "" {
+		return fmt.Errorf("usage: p3sig secret get NAME")
+	}
+	apiBase, keyPath, err := resolveIdentity(f)
+	if err != nil {
+		return err
+	}
+	var res struct {
+		Secrets []struct {
+			Label string `json:"label"`
+			Enc   string `json:"encrypted_data"`
+		} `json:"secrets"`
+	}
+	if err := userRequest(apiBase, "getMySecrets", keyPath, nil, &res); err != nil {
+		return err
+	}
+	key, err := loadKey(keyPath)
+	if err != nil {
+		return err
+	}
+	for _, s := range res.Secrets {
+		if s.Label == name {
+			val, err := openSealedBox(s.Enc, key)
+			if err != nil {
+				return fmt.Errorf("unseal %q: %w", name, err)
+			}
+			fmt.Println(val)
+			return nil
+		}
+	}
+	return fmt.Errorf("no secret named %q on this account", name)
+}
+
+// readSecretValue reads a secret from stdin (piped) or prompts without echo.
+func readSecretValue(name string) (string, error) {
+	fi, _ := os.Stdin.Stat()
+	if (fi.Mode() & os.ModeCharDevice) == 0 { // piped/redirected
+		data, err := os.ReadFile("/dev/stdin")
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimRight(string(data), "\r\n"), nil
+	}
+	fmt.Printf("Value for %q: ", name)
+	in := bufio.NewReader(os.Stdin)
+	line, _ := in.ReadString('\n')
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+func userConfigPath() string {
+	base, err := os.UserConfigDir()
+	if err != nil || base == "" {
+		home, _ := os.UserHomeDir()
+		base = filepath.Join(home, ".config")
+	}
+	return filepath.Join(base, "p3sig", "config.json")
 }

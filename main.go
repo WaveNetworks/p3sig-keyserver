@@ -94,6 +94,22 @@ func main() {
 		}
 	case "exec", "run":
 		err = cmdExec(os.Args[2:])
+	case "login":
+		err = cmdLogin(parseFlags(os.Args[2:]))
+	case "secret":
+		if len(os.Args) < 3 {
+			err = fmt.Errorf("usage: p3sig secret set|get NAME  (manage your own secrets via your vault key)")
+			break
+		}
+		rest := os.Args[3:]
+		switch os.Args[2] {
+		case "set":
+			err = cmdSecretSet(parseFlags(rest), firstPositional(rest))
+		case "get":
+			err = cmdSecretGetUser(parseFlags(rest), firstPositional(rest))
+		default:
+			err = fmt.Errorf("unknown secret subcommand %q (set | get)", os.Args[2])
+		}
 	case "setup":
 		err = cmdSetup(parseFlags(os.Args[2:]))
 	case "ssh-agent":
@@ -346,7 +362,12 @@ func pullInto(apiBase, action, machine string, key ed25519.PrivateKey, extra url
 	form.Set("machine_id", machine)
 	form.Set("ts", ts)
 	form.Set("signature", sig)
+	return postForm(apiBase, form, v)
+}
 
+// postForm POSTs a urlencoded form to the API and unmarshals results into v.
+// Shared by the machine (pullInto) and user (userRequest) signed-request paths.
+func postForm(apiBase string, form url.Values, v any) error {
 	req, err := http.NewRequest("POST", apiBase, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
@@ -509,6 +530,14 @@ SECRETS
   p3sig secrets pull [--export]   Print KEY=VALUE (with --export: shell-quoted exports).
   p3sig run -- CMD [args]    Run CMD with the granted secrets in its environment
                              (alias: p3sig exec).
+
+MANAGE (your account — signs with your vault USB key)
+  p3sig login --key VAULTKEY  Prove your account with your vault key; save an identity.
+                             The account is whoever owns the key — nothing typed.
+  p3sig secret set NAME [--type personal|developer] [--provider P] [--bundle ID]
+                             Store a secret: sealed to your keys CLIENT-SIDE, only
+                             ciphertext uploaded. Value via stdin or prompt (never argv).
+  p3sig secret get NAME      Fetch + unseal one of your secrets locally.
 
 SSH (certificate authority)
   p3sig agent pull           Write TrustedUserCAKeys, AuthorizedPrincipalsFile/<user>, RevokedKeys.
