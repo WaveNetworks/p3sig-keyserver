@@ -35,13 +35,17 @@ by design. The darwin asset must be produced on a Mac.
 4. **Smoke test — Secure Enclave (the Mac-only delta):** the `setup` / `ssh-agent` / Touch-ID
    login acceptance test in `docs/BUILD-macos.md` §5.
 5. **Publish.** Attach the darwin asset(s) to the GitHub release alongside the cross-built
-   linux/windows binaries (below). Name them `p3sig-darwin-arm64` / `p3sig-darwin-amd64`.
-   > Note the **packaging split**: the SE features need the **signed `.app`** (the binary
-   > must carry the provisioning profile). The server/secrets/SSH-CA + Slice 1 features work
-   > from a **plain binary**. Decide whether the darwin release asset is the bare signed
-   > executable extracted from the `.app`, or the `.app` zipped. The bare signed
-   > `p3sig.app/Contents/MacOS/p3sig` retains the entitlement and works for both — prefer
-   > shipping that (zipped to preserve the signature).
+   linux/windows binaries (below). Name them `p3sig-darwin-arm64.zip` / `p3sig-darwin-amd64.zip`.
+   > **Ship the complete signed `.app` bundle (zipped), NOT the extracted Mach-O.** Confirmed on
+   > a Mac: the Secure Enclave entitlement is authorized by the **provisioning profile**, which
+   > lives at `p3sig.app/Contents/embedded.provisionprofile` — extracting just
+   > `Contents/MacOS/p3sig` drops the profile, and Enclave key ops then fail with
+   > `errSecMissingEntitlement (-34018)`. (The server/secrets/SSH-CA + Slice 1 features would
+   > run from a bare binary, but to keep one asset that does everything, ship the `.app`.)
+   > **Per-arch confirmation:** the SE smoke test must run on the matching architecture — an
+   > **Intel Mac can build + confirm `amd64`** but cannot run/confirm an **`arm64`** build, and
+   > vice-versa. If you can only verify one arch, publish the other as cross-built-but-unverified
+   > and say so in the release notes (or get an Apple Silicon Mac to confirm `arm64`).
 
 ## Cross-built targets (any host, cgo-free)
 
