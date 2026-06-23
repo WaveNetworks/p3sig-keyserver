@@ -37,6 +37,7 @@ import (
 )
 
 const httpTimeout = 20 * time.Second
+const userAgent = "p3sig-agent/0.2"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -328,8 +329,17 @@ func pullInto(apiBase, action, machine string, key ed25519.PrivateKey, extra url
 	form.Set("ts", ts)
 	form.Set("signature", sig)
 
+	req, err := http.NewRequest("POST", apiBase, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// A real User-Agent: WAFs (e.g. StackCDN in front of p3sig.com) reject the
+	// default "Go-http-client/1.1" with a 403 before the request reaches the app.
+	req.Header.Set("User-Agent", userAgent)
+
 	client := &http.Client{Timeout: httpTimeout}
-	resp, err := client.Post(apiBase, "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
