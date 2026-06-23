@@ -36,12 +36,15 @@ by design. The darwin asset must be produced on a Mac.
    login acceptance test in `docs/BUILD-macos.md` §5.
 5. **Publish.** Attach the darwin asset(s) to the GitHub release alongside the cross-built
    linux/windows binaries (below). Name them `p3sig-darwin-arm64` / `p3sig-darwin-amd64`.
-   > Note the **packaging split**: the SE features need the **signed `.app`** (the binary
-   > must carry the provisioning profile). The server/secrets/SSH-CA + Slice 1 features work
-   > from a **plain binary**. Decide whether the darwin release asset is the bare signed
-   > executable extracted from the `.app`, or the `.app` zipped. The bare signed
-   > `p3sig.app/Contents/MacOS/p3sig` retains the entitlement and works for both — prefer
-   > shipping that (zipped to preserve the signature).
+   > **Ship the `.app` (zipped), not the bare executable.** The SE features require the
+   > restricted `keychain-access-groups` entitlement, which is authorized by the provisioning
+   > profile embedded at `p3sig.app/Contents/embedded.provisionprofile`. Extracting the bare
+   > `Contents/MacOS/p3sig` separates it from that profile, so **AMFI SIGKILLs it at launch**
+   > — for *every* command, not just the SE ones (verified: even `p3sig help` is killed,
+   > exit 137). So the darwin asset must be the **`.app` zipped** (use `ditto -c -k
+   > --keepParent` to preserve the code signature). If you also want a tiny plain binary for
+   > the server/secrets/SSH-CA + Slice 1 use only, build a **separate** copy signed *without*
+   > the `keychain-access-groups` entitlement (it then runs fine but has no Secure Enclave).
 
 ## Cross-built targets (any host, cgo-free)
 
