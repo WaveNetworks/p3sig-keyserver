@@ -1,5 +1,11 @@
 # Building the macOS binary (Secure Enclave / Touch ID)
 
+> **Cutting a release? Read [`RELEASE.md`](RELEASE.md) first.** Slice 1 (`init`,
+> `server up`, `secrets get/list`) landed in `main` and is pure Go — build the darwin
+> binary from **latest `main`** so it includes those commands. This doc covers the
+> Secure Enclave client path specifically.
+
+
 The macOS chip-backed client key (`keystore_darwin.go`) uses **cgo** against the
 Security framework and a key that lives in the **Secure Enclave**, gated by Touch
 ID. Because the Enclave requires the process to hold a *keychain access group*
