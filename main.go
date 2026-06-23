@@ -94,6 +94,10 @@ func main() {
 		}
 	case "exec", "run":
 		err = cmdExec(os.Args[2:])
+	case "backup":
+		err = cmdBackup(parseFlags(os.Args[2:]))
+	case "restore":
+		err = cmdRestore(parseFlags(os.Args[2:]))
 	case "login":
 		err = cmdLogin(parseFlags(os.Args[2:]))
 	case "secret":
@@ -552,6 +556,13 @@ CLIENT (your laptop)
                              Serve the chip key to ssh (biometric per connection).
 
   p3sig keygen [--out FILE]  Just generate a machine key + print its public half.
+
+RECOVERY
+  p3sig backup [--key FILE] [--out FILE]
+                             Make an offline recovery card for a key — optionally
+                             passphrase-protected. Restores even if every USB is gone.
+  p3sig restore [--in FILE] [--out FILE]
+                             Rebuild a key from a recovery card (no drive/server needed).
 
 CONFIG & OVERRIDES
   A profile saved by ` + "`init`" + ` supplies url/machine/key/out. Override any value with a
