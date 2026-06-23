@@ -2,17 +2,17 @@
 //
 // One binary, two roles:
 //
-//   server role — on a machine you SSH TO / that needs secrets:
-//     p3sig agent pull|run|install   materialize sshd trust files (TrustedUserCAKeys,
-//                                    AuthorizedPrincipalsFile, RevokedKeys/KRL)
-//     p3sig secrets pull             unseal this machine's granted secrets
-//     p3sig exec -- CMD              inject secrets into a process's environment
+//	server role — on a machine you SSH TO / that needs secrets:
+//	  p3sig agent pull|run|install   materialize sshd trust files (TrustedUserCAKeys,
+//	                                 AuthorizedPrincipalsFile, RevokedKeys/KRL)
+//	  p3sig secrets pull             unseal this machine's granted secrets
+//	  p3sig exec -- CMD              inject secrets into a process's environment
 //
-//   identity — every machine has an Ed25519 keypair; p3sig holds only the public
-//   half. Auth is a stateless signed request: Ed25519 signature over
-//   "<machine_id>|<unix_ts>" (no challenge round-trip, no token). Everything the
-//   agent pulls is either public (CA keys, principals, KRL) or sealed ciphertext
-//   it opens locally — so a compromised transport leaks nothing.
+//	identity — every machine has an Ed25519 keypair; p3sig holds only the public
+//	half. Auth is a stateless signed request: Ed25519 signature over
+//	"<machine_id>|<unix_ts>" (no challenge round-trip, no token). Everything the
+//	agent pulls is either public (CA keys, principals, KRL) or sealed ciphertext
+//	it opens locally — so a compromised transport leaks nothing.
 package main
 
 import (
@@ -39,6 +39,10 @@ import (
 const httpTimeout = 20 * time.Second
 const userAgent = "p3sig-agent/0.2"
 
+// Fallbacks when a value isn't given by flag, env (P3SIG_*), or a saved profile.
+const defaultAPI = "https://p3sig.com/p3sig/api/index.php"
+const defaultOut = "/etc/p3sig/ssh"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -48,6 +52,14 @@ func main() {
 	switch os.Args[1] {
 	case "keygen":
 		err = cmdKeygen(parseFlags(os.Args[2:]))
+	case "init":
+		err = cmdInit(parseFlags(os.Args[2:]))
+	case "server":
+		if len(os.Args) < 3 || os.Args[2] != "up" {
+			err = fmt.Errorf("usage: p3sig server up")
+			break
+		}
+		err = cmdServerUp(parseFlags(os.Args[3:]))
 	case "agent":
 		if len(os.Args) < 3 {
 			err = fmt.Errorf("agent needs a subcommand: pull | run | install")
@@ -65,12 +77,22 @@ func main() {
 			err = fmt.Errorf("unknown agent subcommand %q", os.Args[2])
 		}
 	case "secrets":
-		if len(os.Args) < 3 || os.Args[2] != "pull" {
-			err = fmt.Errorf("usage: p3sig secrets pull --url URL --machine ID --key FILE [--bundle NAME]")
+		if len(os.Args) < 3 {
+			err = fmt.Errorf("usage: p3sig secrets pull|get|list  (run `p3sig help`)")
 			break
 		}
-		err = cmdSecretsPull(parseFlags(os.Args[3:]))
-	case "exec":
+		rest := os.Args[3:]
+		switch os.Args[2] {
+		case "pull":
+			err = cmdSecretsPull(parseFlags(rest))
+		case "list":
+			err = cmdSecretsList(parseFlags(rest))
+		case "get":
+			err = cmdSecretsGet(parseFlags(rest), firstPositional(rest))
+		default:
+			err = fmt.Errorf("unknown secrets subcommand %q (pull | get | list)", os.Args[2])
+		}
+	case "exec", "run":
 		err = cmdExec(os.Args[2:])
 	case "setup":
 		err = cmdSetup(parseFlags(os.Args[2:]))
@@ -210,10 +232,7 @@ func cmdAgentRun(f map[string]string) error {
 }
 
 func cmdAgentInstall(f map[string]string) error {
-	_, _, _, outDir, err := agentArgs(f)
-	if err != nil {
-		return err
-	}
+	_, _, _, outDir := resolveRaw(f) // install only needs the out dir
 	abs, _ := filepath.Abs(outDir)
 	fmt.Printf(`Add to /etc/ssh/sshd_config, then run `+"`p3sig agent run …`"+` (or a systemd timer)
 to keep these files fresh, and reload sshd:
@@ -229,19 +248,20 @@ to keep these files fresh, and reload sshd:
 // ─── secrets: unseal granted secrets ────────────────────────────────────────
 
 func cmdSecretsPull(f map[string]string) error {
-	apiBase, machine, key, _, err := agentArgs(f)
-	if err != nil && f["out"] == "" {
-		// out isn't required for secrets; only the first three are.
-		if apiBase == "" || machine == "" || key == nil {
-			return err
-		}
+	apiBase, machine, key, _, err := resolve(f)
+	if err != nil {
+		return err
 	}
 	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"])
 	if err != nil {
 		return err
 	}
 	for _, kv := range pairs {
-		fmt.Printf("%s=%s\n", kv[0], kv[1])
+		if f["export"] == "true" {
+			fmt.Printf("export %s=%s\n", kv[0], shellQuote(kv[1]))
+		} else {
+			fmt.Printf("%s=%s\n", kv[0], kv[1])
+		}
 	}
 	return nil
 }
@@ -260,12 +280,10 @@ func cmdExec(args []string) error {
 	}
 	f := parseFlags(args[:sep])
 	cmdArgs := args[sep+1:]
-	apiBase, machine, key := f["url"], f["machine"], (ed25519.PrivateKey)(nil)
-	k, err := loadKey(f["key"])
+	apiBase, machine, key, _, err := resolve(f)
 	if err != nil {
 		return err
 	}
-	key = k
 	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"])
 	if err != nil {
 		return err
@@ -425,17 +443,25 @@ func loadKey(path string) (ed25519.PrivateKey, error) {
 	return ed25519.PrivateKey(raw), nil
 }
 
-// agentArgs pulls the shared --url/--machine/--key/--out flags.
+// agentArgs resolves the shared url/machine/key/out values (flag > env > profile
+// > default) so every agent command works with no flags after `p3sig init`.
 func agentArgs(f map[string]string) (apiBase, machine string, key ed25519.PrivateKey, outDir string, err error) {
-	apiBase, machine, outDir = f["url"], f["machine"], f["out"]
-	if outDir == "" {
-		outDir = "/etc/p3sig/ssh"
+	return resolve(f)
+}
+
+// firstPositional returns the first non-flag argument (skipping flag values),
+// e.g. NAME in `secrets get NAME --bundle b`.
+func firstPositional(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if strings.HasPrefix(args[i], "--") {
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+				i++
+			}
+			continue
+		}
+		return args[i]
 	}
-	if apiBase == "" || machine == "" {
-		return "", "", nil, "", fmt.Errorf("--url and --machine are required")
-	}
-	key, err = loadKey(f["key"])
-	return apiBase, machine, key, outDir, err
+	return ""
 }
 
 // safeUser rejects login names that could escape the principals directory.
@@ -470,34 +496,40 @@ func parseFlags(args []string) map[string]string {
 func usage() {
 	fmt.Print(`p3sig — agent for p3sig.com (zero-knowledge vault + SSH CA)
 
-USAGE
-  p3sig keygen [--out FILE]
-        Generate this machine's Ed25519 identity; print its public key to register.
+GETTING STARTED
+  p3sig init                 Enroll this machine (guided): generate its key, walk you
+                             through registering it, and save a profile. After this,
+                             the commands below need no --url/--machine/--key flags.
+  p3sig server up            Turnkey server: enroll if needed, pull SSH trust files,
+                             offer to wire sshd + install a refresh service.
 
-  p3sig agent pull    --url URL --machine ID --key FILE [--out DIR]
-        Fetch + write TrustedUserCAKeys, AuthorizedPrincipalsFile/<user>, RevokedKeys.
-  p3sig agent run     --url URL --machine ID --key FILE [--out DIR] [--interval SEC]
-        Same, looping every --interval seconds (default 300).
-  p3sig agent install [--out DIR]
-        Print the sshd_config lines to add.
+SECRETS
+  p3sig secrets list         List the secret names granted to this machine.
+  p3sig secrets get NAME     Print one secret's value.
+  p3sig secrets pull [--export]   Print KEY=VALUE (with --export: shell-quoted exports).
+  p3sig run -- CMD [args]    Run CMD with the granted secrets in its environment
+                             (alias: p3sig exec).
 
-  p3sig secrets pull  --url URL --machine ID --key FILE [--bundle NAME]
-        Unseal this machine's granted secrets, print KEY=VALUE.
-  p3sig exec          --url URL --machine ID --key FILE [--bundle NAME] -- CMD [args...]
-        Inject those secrets into CMD's environment and run it.
+SSH (certificate authority)
+  p3sig agent pull           Write TrustedUserCAKeys, AuthorizedPrincipalsFile/<user>, RevokedKeys.
+  p3sig agent run [--interval SEC]   Same, looping (default 300s).
+  p3sig agent install        Print the sshd_config lines to add.
 
-  p3sig setup         [--label NAME] [--show] [--delete]
-        Create a chip-backed SSH client key (TPM / Secure Enclave, gated by
-        Windows Hello / Touch ID) and print its OpenSSH public key. --show prints
-        an existing key; --delete removes it. Default label "p3sig".
-  p3sig ssh-agent     [--label NAME] [--bind PATH]
-        Run an ssh-agent serving the chip key; ssh signs through it, tapping the
-        biometric per connection. --bind is a unix socket path (macOS/Linux) or a
-        named pipe (Windows; default \\.\pipe\openssh-ssh-agent).
+CLIENT (your laptop)
+  p3sig setup [--label N] [--show] [--delete]
+                             Create a chip-backed SSH key (TPM / Secure Enclave,
+                             gated by Windows Hello / Touch ID); --show / --delete.
+  p3sig ssh-agent [--label N] [--bind PATH]
+                             Serve the chip key to ssh (biometric per connection).
 
-DEFAULTS
-  --out defaults to /etc/p3sig/ssh
-  --url e.g. https://p3sig.com/p3sig/api/index.php
+  p3sig keygen [--out FILE]  Just generate a machine key + print its public half.
+
+CONFIG & OVERRIDES
+  A profile saved by ` + "`init`" + ` supplies url/machine/key/out. Override any value with a
+  flag (--url --machine --key --out --bundle), an env var (P3SIG_URL, P3SIG_MACHINE,
+  P3SIG_KEY, P3SIG_OUT), or pick a profile with --profile / P3SIG_PROFILE.
+  Config: $P3SIG_CONFIG, else ~/.config/p3sig/config.json, else /etc/p3sig/config.json.
+  Defaults: --url ` + defaultAPI + `  --out ` + defaultOut + `
 
 Auth is a stateless signed request: Ed25519 over "<machine_id>|<unix_ts>".
 `)
