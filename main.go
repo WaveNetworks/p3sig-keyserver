@@ -558,11 +558,13 @@ CLIENT (your laptop)
   p3sig keygen [--out FILE]  Just generate a machine key + print its public half.
 
 RECOVERY
-  p3sig backup [--key FILE] [--out FILE]
+  p3sig backup [--key FILE] [--out FILE] [--split M-of-N]
                              Make an offline recovery card for a key — optionally
-                             passphrase-protected. Restores even if every USB is gone.
+                             passphrase-protected, or --split into N shares (any M
+                             recover; each useless alone — for estates/custody).
+                             Restores even if every USB is gone.
   p3sig restore [--in FILE] [--out FILE]
-                             Rebuild a key from a recovery card (no drive/server needed).
+                             Rebuild a key from a card, or from ≥M shares (no drive/server).
 
 CONFIG & OVERRIDES
   A profile saved by ` + "`init`" + ` supplies url/machine/key/out. Override any value with a
