@@ -11,10 +11,12 @@
       wizard, `p3sig server up` (writes sshd drop-in + systemd service), `secrets list`/`get`,
       `secrets pull --export`, `run` alias. All pure Go; verified E2E vs live p3sig.com.
 
-## Release pending
-- [ ] **Cut a release that includes Slice 1** — see `docs/RELEASE.md`. linux/windows are
-      cgo-free cross-builds; the **darwin asset must be built on a Mac** (cgo, Secure Enclave)
-      from latest `main`. The current published darwin asset predates Slice 1 + the SE keystore.
+## Released
+- [x] **v0.3.0 (2026-06-23)** — Slice 1 + Slice 2 + recovery cards/split + chip-backed SSH
+      keys (macOS Secure Enclave, Windows TPM/CNG). 5 assets: darwin amd64/arm64 `.app` zips,
+      linux amd64/arm64, windows amd64. Published linux binary smoke-tested (recovery round-trip).
+      darwin **arm64 is cross-built + UNVERIFIED** (built on an Intel Mac) — confirm on Apple
+      Silicon when available; amd64 verified end-to-end with Touch ID.
 
 ## Next: Slice 2 — CLI management (USB-signs) + device-code enroll
 Full spec in **`docs/SLICE-2.md`**. Needs new server endpoints in `WaveNetworks/p3sig`.
