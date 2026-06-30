@@ -57,6 +57,10 @@ repos. Add it as a repo secret on `p3sig-keyserver`.
 ### 4. macOS signing + notarization (the involved one)
 You need an **Apple Developer Program** membership.
 
+> Setting these from a Mac (e.g. via Claude Code on a Mac)? Follow the
+> step-by-step **[docs/MACOS-SECRETS-SETUP.md](MACOS-SECRETS-SETUP.md)** runbook —
+> it derives the identity from the keychain and runs every `gh secret set` for you.
+
 **Certificate** — a *Developer ID Application* cert (not "Apple Development"):
 - Create it in the Apple Developer portal, export from Keychain Access as a
   `.p12` with a password.
