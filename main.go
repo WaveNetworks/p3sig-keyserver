@@ -43,6 +43,10 @@ const userAgent = "p3sig-agent/0.2"
 const defaultAPI = "https://p3sig.com/p3sig/api/index.php"
 const defaultOut = "/etc/p3sig/ssh"
 
+// version is the release version, injected at build time via
+// -ldflags "-X main.version=...". It stays "dev" for plain `go build`.
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -118,6 +122,8 @@ func main() {
 		err = cmdSetup(parseFlags(os.Args[2:]))
 	case "ssh-agent":
 		err = cmdSSHAgent(parseFlags(os.Args[2:]))
+	case "version", "-v", "--version":
+		fmt.Println("p3sig", version)
 	case "help", "-h", "--help":
 		usage()
 	default:

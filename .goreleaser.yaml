@@ -1,0 +1,163 @@
+# GoReleaser config for p3sig — https://goreleaser.com
+#
+# Scope: this file builds + publishes the CGO-FREE targets (linux amd64/arm64,
+# windows amd64) and every package manager that consumes them. macOS is built,
+# signed and notarized SEPARATELY in .github/workflows/release.yml (it needs cgo
+# on a real Mac + a provisioning profile) and its signed .app zips are attached
+# to the same GitHub release via `release.extra_files`, then a Homebrew *cask*
+# (rendered in the workflow) points at them. See docs/PACKAGING.md.
+#
+# Publisher gating (set repo variable GORELEASER_SKIP to skip until ready):
+#   needs only TAP_GITHUB_TOKEN : scoop, nfpm (deb/rpm), github release
+#   needs WINGET_GITHUB_TOKEN   : winget   (a fork of microsoft/winget-pkgs)
+#   needs AUR_KEY               : aur      (an AUR account + ssh deploy key)
+version: 2
+
+project_name: p3sig
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: p3sig
+    binary: p3sig
+    main: .
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # ship only windows/amd64 (windows arm64 is unvalidated)
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: p3sig
+    ids: [p3sig]
+    name_template: "p3sig_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+# Linux native packages → apt (.deb) / dnf-yum (.rpm)
+nfpms:
+  - id: p3sig
+    ids: [p3sig]
+    package_name: p3sig
+    vendor: Wave Networks
+    homepage: https://p3sig.com
+    maintainer: Wave Networks <support@p3sig.com>
+    description: |-
+      p3sig agent — zero-knowledge secrets vault client and SSH certificate
+      authority agent. One binary that delivers sealed secrets and materializes
+      sshd trust files where they are needed.
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    contents:
+      - src: README.md
+        dst: /usr/share/doc/p3sig/README.md
+      - src: LICENSE
+        dst: /usr/share/doc/p3sig/LICENSE
+
+# Windows: Scoop bucket (self-serve, no review)
+scoops:
+  - name: p3sig
+    ids: [p3sig]
+    repository:
+      owner: WaveNetworks
+      name: scoop-bucket
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    directory: bucket
+    homepage: https://p3sig.com
+    description: "Zero-knowledge secrets vault client and SSH certificate authority agent."
+    license: MIT
+
+# Windows: winget (official, PR into microsoft/winget-pkgs from your fork)
+winget:
+  - name: p3sig
+    package_identifier: WaveNetworks.p3sig
+    ids: [p3sig]
+    publisher: WaveNetworks
+    publisher_url: https://p3sig.com
+    copyright: "Wave Networks"
+    license: MIT
+    license_url: https://github.com/WaveNetworks/p3sig-keyserver/blob/main/LICENSE
+    homepage: https://p3sig.com
+    short_description: "Zero-knowledge secrets vault client and SSH certificate authority agent."
+    release_notes_url: "https://github.com/WaveNetworks/p3sig-keyserver/releases/tag/{{ .Tag }}"
+    repository:
+      owner: WaveNetworks
+      name: winget-pkgs
+      branch: "p3sig-{{ .Version }}"
+      token: "{{ .Env.WINGET_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: true
+        draft: false
+        base:
+          owner: microsoft
+          name: winget-pkgs
+          branch: master
+
+# Arch Linux: AUR (-bin package, prebuilt binary)
+aurs:
+  - name: p3sig-bin
+    ids: [p3sig]
+    homepage: https://p3sig.com
+    description: "Zero-knowledge secrets vault client and SSH certificate authority agent."
+    maintainers:
+      - "Wave Networks <support@p3sig.com>"
+    license: MIT
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/p3sig-bin.git"
+    provides:
+      - p3sig
+    conflicts:
+      - p3sig
+    package: |-
+      install -Dm755 "./p3sig" "${pkgdir}/usr/bin/p3sig"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/p3sig/LICENSE"
+      install -Dm644 "./README.md" "${pkgdir}/usr/share/doc/p3sig/README.md"
+
+release:
+  github:
+    owner: WaveNetworks
+    name: p3sig-keyserver
+  draft: false
+  prerelease: auto
+  # The signed + notarized macOS .app zips are produced by the `macos` CI job
+  # and dropped in ./macos-dist/ before goreleaser runs (outside ./dist so
+  # --clean doesn't wipe them). Attach them to the same release.
+  extra_files:
+    - glob: ./macos-dist/*.zip

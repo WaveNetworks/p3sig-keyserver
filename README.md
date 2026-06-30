@@ -13,13 +13,26 @@ One Go binary, two roles, for [p3sig.com](https://p3sig.com) (zero-knowledge vau
 
 ## Install
 
-Download the binary for your platform from the [latest release](../../releases/latest), then:
-
+**macOS** (Homebrew — signed, notarized Secure Enclave build):
 ```sh
-chmod +x p3sig-<os>-<arch> && sudo mv p3sig-<os>-<arch> /usr/local/bin/p3sig
+brew install --cask WaveNetworks/tap/p3sig
 ```
 
-(Windows: rename `p3sig-windows-amd64.exe` to `p3sig.exe`.)
+**Linux** (one-liner, or apt/dnf packages from the [release](../../releases/latest)):
+```sh
+curl -fsSL https://raw.githubusercontent.com/WaveNetworks/p3sig-keyserver/main/install.sh | sh
+```
+
+**Windows**:
+```powershell
+scoop bucket add p3sig https://github.com/WaveNetworks/scoop-bucket; scoop install p3sig
+# or
+winget install WaveNetworks.p3sig
+```
+
+**Arch:** `yay -S p3sig-bin`
+
+Or grab the binary for your platform from the [latest release](../../releases/latest) and put it on your PATH manually. Release automation (GoReleaser + signed macOS CI) is documented in [docs/PACKAGING.md](docs/PACKAGING.md).
 
 ## Quick start (a server that trusts p3sig-issued certificates)
 

@@ -1,0 +1,27 @@
+cask "p3sig" do
+  version "@@VERSION@@"
+
+  on_arm do
+    sha256 "@@SHA_ARM@@"
+    url "https://github.com/WaveNetworks/p3sig-keyserver/releases/download/@@TAG@@/p3sig-darwin-arm64.zip"
+  end
+  on_intel do
+    sha256 "@@SHA_AMD@@"
+    url "https://github.com/WaveNetworks/p3sig-keyserver/releases/download/@@TAG@@/p3sig-darwin-amd64.zip"
+  end
+
+  name "p3sig"
+  desc "Zero-knowledge secrets vault client and SSH certificate authority agent"
+  homepage "https://p3sig.com"
+
+  # Ship the signed .app — its embedded provisioning profile authorizes the
+  # Secure Enclave keychain-access-group. The `binary` stanza SYMLINKS the
+  # in-bundle executable onto PATH (a symlink keeps it next to the profile, so
+  # AMFI is happy; copying the bare binary out would get it SIGKILLed).
+  app "p3sig.app"
+  binary "#{appdir}/p3sig.app/Contents/MacOS/p3sig"
+
+  zap trash: [
+    "~/.config/p3sig",
+  ]
+end

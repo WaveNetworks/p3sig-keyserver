@@ -1,0 +1,140 @@
+name: release
+
+# Cut a release by pushing a semver tag:  git tag v0.4.0 && git push origin v0.4.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ── 1. macOS: cgo build on a real Mac, sign + notarize, zip the .app ────────
+  macos:
+    runs-on: macos-14
+    outputs:
+      sha_arm: ${{ steps.shas.outputs.sha_arm }}
+      sha_amd: ${{ steps.shas.outputs.sha_amd }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/p3sig-signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+      - name: Stage provisioning profile + notary key
+        env:
+          MACOS_PROVISION_PROFILE_BASE64: ${{ secrets.MACOS_PROVISION_PROFILE_BASE64 }}
+          AC_API_KEY_P8_BASE64: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          echo "$MACOS_PROVISION_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/p3sig.provisionprofile"
+          echo "$AC_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/ac_api_key.p8"
+
+      - name: Build + sign + notarize (arm64 and amd64)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          export PROFILE="$RUNNER_TEMP/p3sig.provisionprofile"
+          export AC_API_KEY_PATH="$RUNNER_TEMP/ac_api_key.p8"
+          export VERSION="${GITHUB_REF_NAME}"
+          chmod +x scripts/build-macos-ci.sh
+          scripts/build-macos-ci.sh arm64
+          scripts/build-macos-ci.sh amd64
+
+      - name: Compute checksums
+        id: shas
+        run: |
+          set -euo pipefail
+          echo "sha_arm=$(shasum -a 256 macos-dist/p3sig-darwin-arm64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "sha_amd=$(shasum -a 256 macos-dist/p3sig-darwin-amd64.zip | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dist
+          path: macos-dist/*.zip
+          retention-days: 5
+
+  # ── 2. Linux + Windows + every package manager (GoReleaser) ─────────────────
+  release:
+    needs: macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Pull in notarized macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-dist
+          path: macos-dist
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean ${{ vars.GORELEASER_SKIP != '' && format('--skip={0}', vars.GORELEASER_SKIP) || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
+          AUR_KEY: ${{ secrets.AUR_KEY }}
+
+      # ── 3. Homebrew cask → WaveNetworks/homebrew-tap (macOS install path) ───
+      - name: Publish Homebrew cask
+        if: ${{ !contains(vars.GORELEASER_SKIP, 'cask') }}
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          SHA_ARM: ${{ needs.macos.outputs.sha_arm }}
+          SHA_AMD: ${{ needs.macos.outputs.sha_amd }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          sed -e "s/@@VERSION@@/${VERSION}/g" \
+              -e "s/@@TAG@@/${TAG}/g" \
+              -e "s/@@SHA_ARM@@/${SHA_ARM}/g" \
+              -e "s/@@SHA_AMD@@/${SHA_AMD}/g" \
+              packaging/p3sig.cask.rb.tmpl > /tmp/p3sig.rb
+
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/WaveNetworks/homebrew-tap.git" /tmp/tap
+          mkdir -p /tmp/tap/Casks
+          cp /tmp/p3sig.rb /tmp/tap/Casks/p3sig.rb
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/p3sig.rb
+          if git diff --staged --quiet; then
+            echo "cask unchanged"
+          else
+            git commit -m "p3sig ${VERSION}"
+            git push
+          fi
