@@ -295,6 +295,14 @@ func (secureEnclave) Sign(label string, data []byte) ([]byte, error) {
 	return sig, nil // ASN.1 DER; agent.go normalizeECDSASig handles it
 }
 
+// Agree performs ECDH with the Secure Enclave key for enclave-held vault-key
+// unwrap. Not yet implemented — see T3 (docs/device-enrollment-phase1-tasks.md).
+// Will use SecKeyCopyKeyExchangeResult (ECDHKeyExchangeStandard); the Enclave
+// already returns the big-endian X, so no byte reversal is needed here.
+func (secureEnclave) Agree(label string, peerPubSEC1 []byte) ([]byte, error) {
+	return nil, fmt.Errorf("secure enclave: Agree (ECDH) not implemented yet (T3)")
+}
+
 func (secureEnclave) Delete(label string) error {
 	tag := C.CString(appTag(label))
 	defer C.free(unsafe.Pointer(tag))

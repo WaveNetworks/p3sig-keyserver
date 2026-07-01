@@ -168,6 +168,15 @@ func (winHello) Sign(label string, data []byte) ([]byte, error) {
 	return sig[:cb], nil // r||s, normalized by the shared agent
 }
 
+// Agree performs ECDH with the Windows Hello key for enclave-held vault-key
+// unwrap. Not yet implemented — see T4 (docs/device-enrollment-phase1-tasks.md).
+// Will use NCryptSecretAgreement + NCryptDeriveKey(BCRYPT_KDF_RAW_SECRET); NCrypt
+// returns the shared secret little-endian, so the real impl must REVERSE it to the
+// big-endian X coordinate before returning.
+func (winHello) Agree(label string, peerPubSEC1 []byte) ([]byte, error) {
+	return nil, fmt.Errorf("windows hello: Agree (ECDH) not implemented yet (T4)")
+}
+
 func (winHello) Delete(label string) error {
 	prov, key, _, err := openExistingKey(label)
 	if err != nil {

@@ -16,6 +16,15 @@ type Keystore interface {
 	// Sign signs data with the chip key, prompting the biometric. macOS returns
 	// a DER ECDSA signature; Windows returns r||s — the ssh-agent normalizes both.
 	Sign(label string, data []byte) (signature []byte, err error)
+	// Agree performs ECDH between the chip's P-256 private key and peerPubSEC1 — a
+	// peer public key as an uncompressed SEC1 point (0x04‖X‖Y, 65 bytes) — prompting
+	// the biometric. It returns the 32-byte big-endian X coordinate of the shared
+	// point: the raw ECDH secret that wrap.go feeds to HKDF in the
+	// ecdh-p256-hkdf-aesgcm scheme. This is the unwrap-time "unlock" for an
+	// enclave-held vault key (see docs/device-enrollment-phase1-T2-wrap-spec.md).
+	// Note: Windows/NCrypt yields the shared secret little-endian, so that backend
+	// must reverse it to big-endian before returning.
+	Agree(label string, peerPubSEC1 []byte) (shared []byte, err error)
 	// Delete removes the key from the keystore.
 	Delete(label string) error
 }
