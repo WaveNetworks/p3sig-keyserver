@@ -2,6 +2,7 @@
 /p3sig.exe
 /p3sig-*
 /dist/
+/macos-dist/
 *.key
 kg.txt
 /p3sig.app/
