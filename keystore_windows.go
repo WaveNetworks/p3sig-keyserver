@@ -42,6 +42,9 @@ var (
 	procSetProperty         = ncrypt.NewProc("NCryptSetProperty")
 	procFinalizeKey         = ncrypt.NewProc("NCryptFinalizeKey")
 	procExportKey           = ncrypt.NewProc("NCryptExportKey")
+	procImportKey           = ncrypt.NewProc("NCryptImportKey")
+	procSecretAgreement     = ncrypt.NewProc("NCryptSecretAgreement")
+	procDeriveKey           = ncrypt.NewProc("NCryptDeriveKey")
 	procSignHash            = ncrypt.NewProc("NCryptSignHash")
 	procDeleteKey           = ncrypt.NewProc("NCryptDeleteKey")
 	procFreeObject          = ncrypt.NewProc("NCryptFreeObject")
@@ -51,13 +54,19 @@ const (
 	msPlatformProvider = "Microsoft Platform Crypto Provider"      // TPM-backed
 	msSoftwareProvider = "Microsoft Software Key Storage Provider" // fallback, no HW
 
-	algECDSAP256  = "ECDSA_P256"    // BCRYPT_ECDSA_P256_ALGORITHM
+	algECDSAP256  = "ECDSA_P256"    // BCRYPT_ECDSA_P256_ALGORITHM (signing)
+	algECDHP256   = "ECDH_P256"     // NCRYPT_ECDH_P256_ALGORITHM (key agreement)
 	blobECCPublic = "ECCPUBLICBLOB" // BCRYPT_ECCPUBLIC_BLOB
 	propUIPolicy  = "UI Policy"     // NCRYPT_UI_POLICY_PROPERTY
 
+	// BCRYPT_KDF_RAW_SECRET — hands back the ECDH shared secret untouched. CNG
+	// spells it "TRUNCATE"; the returned bytes are LITTLE-endian (classic footgun).
+	bcryptKDFRawSecret = "TRUNCATE"
+
 	ncryptUIProtectKeyFlag = 0x00000001 // require auth (Windows Hello) on use
 
-	bcryptECDSAPublicP256Magic = 0x31534345 // "ECS1"
+	bcryptECDSAPublicP256Magic = 0x31534345 // "ECS1" (BCRYPT_ECDSA_PUBLIC_P256_MAGIC)
+	bcryptECDHPublicP256Magic  = 0x314B4345 // "ECK1" (BCRYPT_ECDH_PUBLIC_P256_MAGIC)
 )
 
 // ncryptUIPolicy mirrors NCRYPT_UI_POLICY (sizeof == 32 on amd64).
@@ -71,6 +80,11 @@ type ncryptUIPolicy struct {
 
 // keyName is the CNG key container name (namespaced under "p3sig").
 func keyName(label string) string { return `p3sig\` + label }
+
+// agreeName is the container name of the dedicated ECDH key for device enrollment.
+// It is SEPARATE from the SSH signing key: CNG will not let one key do both signing
+// and key agreement (the signer is BCRYPT_ECDSA_P256, agreement needs ECDH_P256).
+func agreeName(label string) string { return keyName(label + "-ecdh") }
 
 // ─── Keystore interface ─────────────────────────────────────────────────────
 
@@ -168,13 +182,146 @@ func (winHello) Sign(label string, data []byte) ([]byte, error) {
 	return sig[:cb], nil // r||s, normalized by the shared agent
 }
 
-// Agree performs ECDH with the Windows Hello key for enclave-held vault-key
-// unwrap. Not yet implemented — see T4 (docs/device-enrollment-phase1-tasks.md).
-// Will use NCryptSecretAgreement + NCryptDeriveKey(BCRYPT_KDF_RAW_SECRET); NCrypt
-// returns the shared secret little-endian, so the real impl must REVERSE it to the
-// big-endian X coordinate before returning.
+// CreateAgreementKey creates the dedicated non-extractable ECDH P-256 key used for
+// device-enrollment vault-key unwrap (gated by Windows Hello) and returns its public
+// key as an uncompressed SEC1 point (0x04‖X‖Y, 65 bytes) — the server stores this as
+// chip_public_key and wraps the vault key to it (see wrap.go / WrapECDH).
+//
+// This is a SEPARATE key from the SSH signer that Create makes: that one is
+// BCRYPT_ECDSA_P256, and CNG refuses NCryptSecretAgreement on a signing key —
+// agreement requires an NCRYPT_ECDH_P256_ALGORITHM key. The two live under distinct
+// container names (<label> for signing, <label>-ecdh for agreement).
+//
+// NB: this is intentionally a concrete method on winHello, not (yet) part of the
+// Keystore interface — promoting it would require a matching darwin implementation,
+// which T3 owns. Promote it to the interface once the macOS side lands.
+func (winHello) CreateAgreementKey(label string) ([]byte, error) {
+	// Refuse to clobber an existing ECDH key — let the user --delete first.
+	if prov, key, _, err := openExistingKeyByName(agreeName(label)); err == nil {
+		freeObject(key)
+		freeObject(prov)
+		return nil, fmt.Errorf("agreement key %q already exists; remove it first: p3sig setup --label %s-ecdh --delete", label, label)
+	}
+
+	prov, provName, err := openProvider()
+	if err != nil {
+		return nil, err
+	}
+	defer freeObject(prov)
+
+	algPtr, _ := windows.UTF16PtrFromString(algECDHP256)
+	namePtr, _ := windows.UTF16PtrFromString(agreeName(label))
+	var hKey ncHandle
+	r1, _, _ := procCreatePersistedKey.Call(
+		uintptr(prov), uintptr(unsafe.Pointer(&hKey)),
+		uintptr(unsafe.Pointer(algPtr)), uintptr(unsafe.Pointer(namePtr)), 0, 0)
+	runtime.KeepAlive(algPtr)
+	runtime.KeepAlive(namePtr)
+	if err := ncCheck("NCryptCreatePersistedKey(ECDH)", r1); err != nil {
+		return nil, fmt.Errorf("create ECDH key in %q: %w", provName, err)
+	}
+	defer freeObject(hKey)
+
+	// Require Windows Hello on every use of the private key (i.e. on Agree).
+	title, _ := windows.UTF16PtrFromString("p3sig device key")
+	friendly, _ := windows.UTF16PtrFromString("p3sig device-unlock key (" + label + ")")
+	desc, _ := windows.UTF16PtrFromString("Authorize unlocking your p3sig vault key with your chip")
+	pol := ncryptUIPolicy{
+		Version:       1,
+		Flags:         ncryptUIProtectKeyFlag,
+		CreationTitle: title,
+		FriendlyName:  friendly,
+		Description:   desc,
+	}
+	if err := setProperty(hKey, propUIPolicy, unsafe.Pointer(&pol), uint32(unsafe.Sizeof(pol))); err != nil {
+		return nil, fmt.Errorf("set Windows Hello UI policy: %w", err)
+	}
+	runtime.KeepAlive(&pol)
+	runtime.KeepAlive(title)
+	runtime.KeepAlive(friendly)
+	runtime.KeepAlive(desc)
+
+	r1, _, _ = procFinalizeKey.Call(uintptr(hKey), 0)
+	if err := ncCheck("NCryptFinalizeKey(ECDH)", r1); err != nil {
+		return nil, err
+	}
+	if provName == msSoftwareProvider {
+		fmt.Fprintln(os.Stderr, "warning: ECDH key created in the SOFTWARE provider — NOT protected by the TPM")
+	}
+	return exportPubSEC1(hKey)
+}
+
+// Agree performs ECDH between the Windows Hello ECDH key <label>-ecdh (made by
+// CreateAgreementKey) and peerPubSEC1 (an uncompressed SEC1 point 0x04‖X‖Y, 65 bytes),
+// prompting Windows Hello. It returns the 32-byte big-endian X coordinate of the
+// shared point — the raw secret UnwrapECDH feeds to HKDF.
+//
+// Footgun handled here: NCryptDeriveKey(BCRYPT_KDF_RAW_SECRET) returns the shared X
+// LITTLE-endian, so we reverse it to big-endian to match wrap.go and the macOS backend.
 func (winHello) Agree(label string, peerPubSEC1 []byte) ([]byte, error) {
-	return nil, fmt.Errorf("windows hello: Agree (ECDH) not implemented yet (T4)")
+	if len(peerPubSEC1) != ecdhPubLen || peerPubSEC1[0] != 0x04 {
+		return nil, fmt.Errorf("peer public key must be a %d-byte uncompressed SEC1 point (0x04‖X‖Y), got %d bytes", ecdhPubLen, len(peerPubSEC1))
+	}
+
+	// Open our persisted ECDH key under whichever provider holds it (TPM, else SW).
+	prov, key, _, err := openExistingKeyByName(agreeName(label))
+	if err != nil {
+		return nil, err
+	}
+	defer freeObject(prov)
+	defer freeObject(key)
+
+	// Build a BCRYPT_ECCKEY_BLOB {magic, cbKey=32} + X(32) + Y(32) for the peer and
+	// import it as a bare public key (hImportKey = 0, no wrapping).
+	blob := make([]byte, 8+64)
+	binary.LittleEndian.PutUint32(blob[0:4], bcryptECDHPublicP256Magic)
+	binary.LittleEndian.PutUint32(blob[4:8], 32)
+	copy(blob[8:], peerPubSEC1[1:65]) // X‖Y, big-endian, as-is
+
+	blobType, _ := windows.UTF16PtrFromString(blobECCPublic)
+	var hPeer ncHandle
+	r1, _, _ := procImportKey.Call(
+		uintptr(prov), 0, uintptr(unsafe.Pointer(blobType)), 0,
+		uintptr(unsafe.Pointer(&hPeer)),
+		uintptr(unsafe.Pointer(&blob[0])), uintptr(len(blob)), 0)
+	runtime.KeepAlive(blobType)
+	runtime.KeepAlive(&blob[0])
+	if err := ncCheck("NCryptImportKey(peer)", r1); err != nil {
+		return nil, err
+	}
+	defer freeObject(hPeer)
+
+	// The ECDH itself — this is where Windows Hello prompts.
+	var hSecret ncHandle
+	r1, _, _ = procSecretAgreement.Call(uintptr(key), uintptr(hPeer), uintptr(unsafe.Pointer(&hSecret)), 0)
+	if err := ncCheck("NCryptSecretAgreement", r1); err != nil {
+		return nil, err
+	}
+	defer freeObject(hSecret)
+
+	// Extract the raw shared secret (little-endian X).
+	kdf, _ := windows.UTF16PtrFromString(bcryptKDFRawSecret)
+	le := make([]byte, 32)
+	var cb uint32
+	r1, _, _ = procDeriveKey.Call(
+		uintptr(hSecret), uintptr(unsafe.Pointer(kdf)), 0,
+		uintptr(unsafe.Pointer(&le[0])), uintptr(len(le)),
+		uintptr(unsafe.Pointer(&cb)), 0)
+	runtime.KeepAlive(kdf)
+	if err := ncCheck("NCryptDeriveKey(RAW_SECRET)", r1); err != nil {
+		return nil, err
+	}
+	if cb != 32 {
+		return nil, fmt.Errorf("unexpected ECDH shared-secret length %d (want 32)", cb)
+	}
+
+	// Reverse little-endian → big-endian X coordinate.
+	be := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		be[i] = le[31-i]
+	}
+	zero(le)
+	return be, nil
 }
 
 func (winHello) Delete(label string) error {
@@ -222,10 +369,15 @@ func openProviderByName(name string) (ncHandle, error) {
 	return h, nil
 }
 
-// openExistingKey finds the key under whichever provider holds it (TPM first,
-// then software), so it works regardless of which one Create landed in.
+// openExistingKey finds the SSH signing key for label under whichever provider holds
+// it (TPM first, then software), so it works regardless of which one Create landed in.
 func openExistingKey(label string) (prov, key ncHandle, provName string, err error) {
-	name := keyName(label)
+	return openExistingKeyByName(keyName(label))
+}
+
+// openExistingKeyByName is openExistingKey for an already-composed CNG container name
+// (used for the -ecdh agreement key, whose name is not a bare label).
+func openExistingKeyByName(name string) (prov, key ncHandle, provName string, err error) {
 	var firstErr error
 	for _, pn := range []string{msPlatformProvider, msSoftwareProvider} {
 		p, e := openProviderByName(pn)
@@ -245,9 +397,9 @@ func openExistingKey(label string) (prov, key ncHandle, provName string, err err
 		}
 	}
 	if firstErr == nil {
-		firstErr = fmt.Errorf("key %q not found", label)
+		firstErr = fmt.Errorf("key %q not found", name)
 	}
-	return 0, 0, "", fmt.Errorf("open key %q: %w", label, firstErr)
+	return 0, 0, "", fmt.Errorf("open key %q: %w", name, firstErr)
 }
 
 func openKeyHandle(prov ncHandle, name string) (ncHandle, error) {
@@ -290,6 +442,40 @@ func exportPub(hKey ncHandle, label string) (string, error) {
 		return "", err
 	}
 	return eccBlobToSSH(buf[:cb], label)
+}
+
+// exportPubSEC1 exports an ECDH public key as an uncompressed SEC1 point (0x04‖X‖Y,
+// 65 bytes). CNG exports X and Y big-endian, which is exactly SEC1 order.
+func exportPubSEC1(hKey ncHandle) ([]byte, error) {
+	blobType, _ := windows.UTF16PtrFromString(blobECCPublic)
+	var cb uint32
+	r1, _, _ := procExportKey.Call(uintptr(hKey), 0, uintptr(unsafe.Pointer(blobType)), 0, 0, 0, uintptr(unsafe.Pointer(&cb)), 0)
+	if err := ncCheck("NCryptExportKey(ECDH size)", r1); err != nil {
+		runtime.KeepAlive(blobType)
+		return nil, err
+	}
+	buf := make([]byte, cb)
+	r1, _, _ = procExportKey.Call(uintptr(hKey), 0, uintptr(unsafe.Pointer(blobType)), 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(cb), uintptr(unsafe.Pointer(&cb)), 0)
+	runtime.KeepAlive(blobType)
+	if err := ncCheck("NCryptExportKey(ECDH)", r1); err != nil {
+		return nil, err
+	}
+	blob := buf[:cb]
+	if len(blob) < 8 {
+		return nil, fmt.Errorf("ECDH ECC blob too short (%d bytes)", len(blob))
+	}
+	magic := binary.LittleEndian.Uint32(blob[0:4])
+	cbKey := binary.LittleEndian.Uint32(blob[4:8])
+	if magic != bcryptECDHPublicP256Magic {
+		return nil, fmt.Errorf("unexpected ECDH blob magic 0x%08X (want P-256 ECDH public)", magic)
+	}
+	if int(8+2*cbKey) > len(blob) {
+		return nil, fmt.Errorf("ECDH blob truncated: have %d, need %d", len(blob), 8+2*cbKey)
+	}
+	sec1 := make([]byte, 1+2*cbKey)
+	sec1[0] = 0x04
+	copy(sec1[1:], blob[8:8+2*cbKey]) // X‖Y big-endian, as CNG exports
+	return sec1, nil
 }
 
 // eccBlobToSSH parses a BCRYPT_ECCKEY_BLOB public blob (header + X||Y) into an
