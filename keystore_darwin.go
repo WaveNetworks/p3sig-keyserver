@@ -150,6 +150,57 @@ int se_sign(const char *tag, const char *group, const uint8_t *data, size_t data
 	return 0;
 }
 
+// se_agree: ECDH between the SE private key <tag> and a peer public key given as
+// an X9.63 uncompressed point (0x04||X||Y). Writes the raw shared value — the
+// 32-byte big-endian X coordinate for P-256 — to out. Prompts Touch ID.
+// Returns 0 on success, -1 on error, and -2 for the specific case where the key
+// exists but does not support ECDH key exchange (so Go can report that a
+// dedicated agreement key is needed — see the T3 handoff key-purpose gotcha).
+int se_agree(const char *tag, const char *group,
+             const uint8_t *peer, size_t peerLen,
+             uint8_t *out, size_t *outLen, char *errOut, size_t errCap) {
+	SecKeyRef priv = se_copy_key(tag, group, "Unlock the p3sig vault");
+	if (!priv) { snprintf(errOut, errCap, "key not found for tag %s", tag); return -1; }
+
+	// Key-purpose check: a P-256 SE key created for signing usually also supports
+	// kSecKeyAlgorithmECDHKeyExchangeStandard, but verify before use.
+	if (!SecKeyIsAlgorithmSupported(priv, kSecKeyOperationTypeKeyExchange,
+	                                kSecKeyAlgorithmECDHKeyExchangeStandard)) {
+		CFRelease(priv);
+		snprintf(errOut, errCap, "secure enclave key does not support ECDH key exchange (needs a dedicated agreement key)");
+		return -2;
+	}
+
+	// Rebuild the peer public key from its X9.63 uncompressed representation.
+	CFDataRef peerData = CFDataCreate(kCFAllocatorDefault, peer, (CFIndex)peerLen);
+	CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(attrs, kSecAttrKeyType, kSecAttrKeyTypeECSECPrimeRandom);
+	CFDictionarySetValue(attrs, kSecAttrKeyClass, kSecAttrKeyClassPublic);
+	CFErrorRef e = NULL;
+	SecKeyRef peerPub = SecKeyCreateWithData(peerData, attrs, &e);
+	CFRelease(attrs);
+	CFRelease(peerData);
+	if (!peerPub) { se_set_err(errOut, errCap, e); if (e) CFRelease(e); CFRelease(priv); return -1; }
+
+	// ECDH — Touch ID fires here. Standard exchange returns the raw shared X.
+	CFDictionaryRef params = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
+		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDataRef shared = SecKeyCopyKeyExchangeResult(priv,
+		kSecKeyAlgorithmECDHKeyExchangeStandard, peerPub, params, &e);
+	CFRelease(params);
+	CFRelease(peerPub);
+	CFRelease(priv);
+	if (!shared) { se_set_err(errOut, errCap, e); if (e) CFRelease(e); return -1; }
+
+	CFIndex n = CFDataGetLength(shared);
+	if ((size_t)n > *outLen) { CFRelease(shared); snprintf(errOut, errCap, "shared secret too large (%ld bytes)", (long)n); return -1; }
+	memcpy(out, CFDataGetBytePtr(shared), (size_t)n);
+	*outLen = (size_t)n;
+	CFRelease(shared);
+	return 0;
+}
+
 int se_delete(const char *tag, const char *group, char *errOut, size_t errCap) {
 	CFDataRef t = se_tag_data(tag);
 	CFMutableDictionaryRef q = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
@@ -295,12 +346,35 @@ func (secureEnclave) Sign(label string, data []byte) ([]byte, error) {
 	return sig, nil // ASN.1 DER; agent.go normalizeECDSASig handles it
 }
 
-// Agree performs ECDH with the Secure Enclave key for enclave-held vault-key
-// unwrap. Not yet implemented — see T3 (docs/device-enrollment-phase1-tasks.md).
-// Will use SecKeyCopyKeyExchangeResult (ECDHKeyExchangeStandard); the Enclave
-// already returns the big-endian X, so no byte reversal is needed here.
+// Agree performs ECDH between the Secure Enclave key for label and peerPubSEC1
+// (a peer/ephemeral public key as a 65-byte uncompressed SEC1 point, 0x04||X||Y),
+// prompting Touch ID. It returns the 32-byte big-endian X coordinate of the
+// shared point — the Standard ECDH result is already big-endian on macOS, so no
+// byte reversal is needed (that's a Windows concern). Used to unwrap an
+// enclave-held vault key; see wrap.go's UnwrapECDH and the T3 handoff.
 func (secureEnclave) Agree(label string, peerPubSEC1 []byte) ([]byte, error) {
-	return nil, fmt.Errorf("secure enclave: Agree (ECDH) not implemented yet (T3)")
+	if len(peerPubSEC1) != 65 || peerPubSEC1[0] != 0x04 {
+		return nil, fmt.Errorf("secure enclave: agree with %q: peer key must be a 65-byte uncompressed SEC1 point (0x04||X||Y), got %d bytes", label, len(peerPubSEC1))
+	}
+	tag := C.CString(appTag(label))
+	defer C.free(unsafe.Pointer(tag))
+	group := accessGroup()
+	if group != nil {
+		defer C.free(unsafe.Pointer(group))
+	}
+	out := make([]byte, 32) // P-256 shared X is exactly 32 bytes
+	outLen := C.size_t(len(out))
+	errBuf := make([]byte, 256)
+	rc := C.se_agree(tag, group,
+		(*C.uint8_t)(unsafe.Pointer(&peerPubSEC1[0])), C.size_t(len(peerPubSEC1)),
+		(*C.uint8_t)(unsafe.Pointer(&out[0])), &outLen,
+		(*C.char)(unsafe.Pointer(&errBuf[0])), C.size_t(len(errBuf)))
+	if rc != 0 {
+		return nil, fmt.Errorf("secure enclave: agree with %q: %s", label, cStr(errBuf))
+	}
+	shared := make([]byte, int(outLen))
+	copy(shared, out[:outLen])
+	return shared, nil
 }
 
 func (secureEnclave) Delete(label string) error {
