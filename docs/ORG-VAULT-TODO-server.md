@@ -8,6 +8,28 @@
 > handoff work**, because both native clients (macOS T3 + Windows T4) depend on it and
 > will otherwise ship verbs that can't authenticate.
 
+## ✅ RESOLVED 2026-07-03 (WaveNetworks/p3sig `main` `8bb04f6`, deployed to p3sig.com)
+All three gaps fixed and live:
+1. **Auth mismatch** → a single `p3sig_org_actor()` resolver (new
+   `include/common/userRequestAuth.php`) resolves the caller from an established
+   session **or** the existing `p3sig_user_request_guard` signed request. Applied to
+   every org action in **both** `apiActions/orgApiActions.php` **and**
+   `memberActions/orgActions.php` — one pattern, no duplicate/weaker endpoints. The
+   guard + `p3sig_user_guard_fail` were relocated from `userApiActions.php` into the
+   `common/` library so they're defined before the (earlier-sorting) org action files
+   execute. Verified: session=used, valid-sig=resolved, bad-sig=null, no-auth=null.
+2. **Management API** → the memberActions are already globbed onto the API endpoint, so
+   the actor makes `createOrg/addMember/wrapOrgKeyForMember/changeMemberRole/removeMember/
+   rotateOrgVault` authenticate via signed request too. No new endpoints added.
+3. **listOrgSecrets** → added to `orgApiActions.php`
+   (`{secrets:[{secret_id,label,provider}]}`, org-scoped, active) for the name→id map.
+
+**Client is now unblocked** — the `p3sig org …` verbs (thin layer over `org.go` +
+`userRequest`) can proceed. ZK invariants unchanged. The rest of this doc is the original
+Windows-session spec, kept for reference.
+
+---
+
 ## TL;DR
 The client crypto is done and tested (`org.go`: `createOrgVault`, `unwrapOrgKey`,
 `openOrgSecret`, `wrapOrgKeyFor`, `rotateOrgVault`; wire-compatible with the browser

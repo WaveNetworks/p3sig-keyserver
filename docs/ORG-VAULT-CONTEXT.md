@@ -58,15 +58,20 @@ device-key blob using the chip (`keystore.Agree` P-256 ECDH → HKDF → AES-GCM
 key itself** — Enclave/TPM keys are ECDSA P-256 and can't do the seal crypto; they only
 *unwrap* it. Everything after unlock is identical, platform-independent Go.
 
-## Server API (all signed-request, via `userRequest` cli.go:485; browser via `apiPost`)
-Auth = Ed25519 detached signature over `"<pubkey>|<ts>"` with the personal vault key
-(`p3sig_user_request_guard`). Endpoints (on `feat/organizations`):
+## Server API (dual-source auth; merged to `main` + deployed 2026-07-03)
+Every org action resolves the caller via **one** server-side resolver `p3sig_org_actor()`:
+an established browser **session**, OR — for the native CLI — a stateless Ed25519 signed
+request (`userRequest` cli.go:485) verified by `p3sig_user_request_guard` (detached
+signature over `"<pubkey>|<ts>"` with the personal vault key). Same authorization, one
+code path, no weaker/second pattern. CLI clients send `pubkey`/`ts`/`signature` exactly as
+`secret set`/`login` already do. Endpoints:
 - `getOrgRecipients` → `{recipients:[{key_id, public_key}]}` — seal new org secrets to these (the org vault key).
 - `getOrgKeyWrap` → `{wrap:{wrapped_org_key, org_key_id, member_key_id}|null}` — caller's wrapped org key (null = no vault access yet).
 - `getMemberKeys {member_user_id}` → `{keys:[{key_id, public_key}]}` — a member's personal pubkeys (admin, to wrap for them).
 - `saveSealedSecret {label, provider?, bundle_id?, sealed_copies:JSON}` — store a client-sealed org secret (ciphertext only; server validates key_ids ∈ org recipient set).
 - `getSealedSecret {secret_id}` → `{label, provider, encrypted_data, wrapped_org_key}` — the org-key copy + caller's wrap, to open in-client.
 - `revokeOrgSecret {secret_id}` (admin).
+- `listOrgSecrets` → `{secrets:[{secret_id, label, provider}]}` — metadata only; the name→id map for `org secret get NAME`.
 - Member mgmt (memberActions, also on the API endpoint): `createOrg {name, org_public_key, wrapped_org_key, owner_key_id}`, `addMember {email, role}` (registered accounts only — no invites), `wrapOrgKeyForMember {member_user_id, member_key_id, wrapped_org_key}`, `changeMemberRole`, `removeMember`, `rotateOrgVault {new_org_public_key, sealed:JSON, wraps:JSON}`.
 
 ## Schema (server, FYI) — `include/common/schemaFunctions.php`
