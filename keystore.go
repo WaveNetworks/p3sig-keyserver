@@ -16,6 +16,16 @@ type Keystore interface {
 	// Sign signs data with the chip key, prompting the biometric. macOS returns
 	// a DER ECDSA signature; Windows returns r||s — the ssh-agent normalizes both.
 	Sign(label string, data []byte) (signature []byte, err error)
+	// CreateAgreementKey ensures a biometric-gated ECDH P-256 key exists for label
+	// and returns its public key as an uncompressed SEC1 point (0x04‖X‖Y, 65 bytes).
+	// Device enrollment stores this as chip_public_key and wraps the vault key to it
+	// (WrapECDH); Agree(label, …) later unwraps with the same key.
+	//
+	// Whether this is a distinct key is platform-specific: Windows creates a dedicated
+	// <label>-ecdh key because CNG signing keys can't do ECDH, whereas macOS reuses its
+	// single Secure Enclave key (which supports ECDH directly), so on macOS this returns
+	// that key's point without creating a second key.
+	CreateAgreementKey(label string) (agreementPubSEC1 []byte, err error)
 	// Agree performs ECDH between the chip's P-256 private key and peerPubSEC1 — a
 	// peer public key as an uncompressed SEC1 point (0x04‖X‖Y, 65 bytes) — prompting
 	// the biometric. It returns the 32-byte big-endian X coordinate of the shared
