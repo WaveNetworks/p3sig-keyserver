@@ -346,10 +346,33 @@ func (secureEnclave) Sign(label string, data []byte) ([]byte, error) {
 	return sig, nil // ASN.1 DER; agent.go normalizeECDSASig handles it
 }
 
-// CreateAgreementKey — see the Keystore interface. Real implementation lands in
-// the T12 darwin PR; this stub keeps the darwin build satisfying the interface.
+// CreateAgreementKey — see the Keystore interface. On macOS the Secure Enclave key
+// that Create makes supports ECDH directly (T3), so there is NO separate agreement
+// key: this returns that single key's uncompressed SEC1 public point (0x04||X||Y),
+// and Agree(label, …) unwraps with the same key. The key must already exist —
+// created by `p3sig setup --label <label>`. Reading the public key needs no Touch ID.
 func (secureEnclave) CreateAgreementKey(label string) ([]byte, error) {
-	return nil, fmt.Errorf("secure enclave: CreateAgreementKey not implemented yet (T12)")
+	tag := C.CString(appTag(label))
+	defer C.free(unsafe.Pointer(tag))
+	group := accessGroup()
+	if group != nil {
+		defer C.free(unsafe.Pointer(group))
+	}
+	out := make([]byte, 128)
+	outLen := C.size_t(len(out))
+	errBuf := make([]byte, 256)
+	rc := C.se_pubkey(tag, group,
+		(*C.uint8_t)(unsafe.Pointer(&out[0])), &outLen,
+		(*C.char)(unsafe.Pointer(&errBuf[0])), C.size_t(len(errBuf)))
+	if rc != 0 {
+		return nil, fmt.Errorf("secure enclave: agreement key %q: %s (run `p3sig setup --label %s` first)", label, cStr(errBuf), label)
+	}
+	raw := make([]byte, int(outLen))
+	copy(raw, out[:outLen])
+	if len(raw) != 65 || raw[0] != 0x04 {
+		return nil, fmt.Errorf("secure enclave: agreement key %q: unexpected public key (%d bytes, want 65-byte uncompressed point)", label, len(raw))
+	}
+	return raw, nil
 }
 
 // Agree performs ECDH between the Secure Enclave key for label and peerPubSEC1

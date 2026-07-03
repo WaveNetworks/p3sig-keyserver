@@ -29,7 +29,7 @@ p3sig-keyserver (Go) · **[php]** = p3sig (server).
 | T9 | Tier/keyring scoping (minimal enforcement) [php+ks] | M | ⬜ TODO |
 | T10 | Security review + zeroization audit | M | ⬜ TODO |
 | T11 | Dogfood run + doc status | S | ⬜ TODO |
-| T12 | Promote `CreateAgreementKey` onto the `Keystore` interface [ks] | S | ⏳ HANDED OFF (needs a Mac) |
+| T12 | Promote `CreateAgreementKey` onto the `Keystore` interface [ks] | S | ✅ DONE (interface #2; darwin impl #3) |
 
 ## Notes on the done items
 - **T1** added `Agree(label, peerPubSEC1) (shared, err)` + not-implemented stubs on both
@@ -42,13 +42,17 @@ p3sig-keyserver (Go) · **[php]** = p3sig (server).
   do ECDH). Real Windows Hello/TPM round-trip; shipped v0.5.0.
 
 ## Open follow-ups
-### T12 — promote `CreateAgreementKey` onto the `Keystore` interface · [ks] · S · ⏳
-T4 landed `CreateAgreementKey` as a concrete `winHello` method, not on the interface,
-because promoting it needs a matching **darwin** implementation and couldn't be
-compile-verified off a Mac. Now that T3 (Secure Enclave `Agree`) has landed, add
-`CreateAgreementKey` to the `Keystore` interface + a Secure Enclave impl. **This is an
-interface change → interface-first PR to `main`** (method + stubs on every backend),
-then verify the darwin impl on a Mac. Handoff: author from `handoffs/TEMPLATE.md`.
+### T12 — promote `CreateAgreementKey` onto the `Keystore` interface · [ks] · S · ✅ DONE
+`CreateAgreementKey` is now on the `Keystore` interface. Landed interface-first per
+`CONTRIBUTING.md`: **PR #2** added the interface method + a darwin stub (all platforms
+kept compiling; `winHello`'s existing impl satisfied it); **PR #3** added the Secure
+Enclave impl + Touch ID hardware test on a `claude/t12-macos-*` branch.
+**Design (confirms the T3 finding):** macOS reuses its single SE key — which supports
+ECDH directly — so `CreateAgreementKey` returns that key's uncompressed SEC1 point
+without creating a second key, and `Agree` unwraps with the same key. Windows keeps its
+dedicated `<label>-ecdh` key (CNG signing keys can't do ECDH). Verified on a Mac:
+`TestSecureEnclave_CreateAgreementKeyRoundTrip` (`P3SIG_HW_TEST=1`) — the returned point
+matches the SE key and round-trips `WrapECDH → Agree → UnwrapECDH`.
 
 ## Remaining sequence (T7 onward)
 T7 (enroll) → T8 (wire login/secret to the wrapped key) → T9 (tiers) → T10 (security
