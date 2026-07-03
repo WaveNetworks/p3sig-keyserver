@@ -6,10 +6,13 @@
 > userRequestAuth.php`, session-or-signed-request), every org action switched to it
 > (management verbs included), plus the new `listOrgSecrets` endpoint. Verified by review
 > against this spec. The client verbs are now built — `p3sig org create/add/grant/secret
-> set|get|list` in `org_cli.go`. **One remaining server item:** a `listOrgSecrets`-style
-> **`listOrgMembers`** endpoint is still needed for `p3sig org rotate` (the CLI can't
-> enumerate members to re-wrap); until then, rotate from the web UI. The original spec is
-> kept below for reference.
+> set|get|list` in `org_cli.go`. **`listOrgMembers` now also shipped** (p3sig `main`
+> **`b7509f8`**, deployed): admin-only, returns each active member with `role`, `status`,
+> `has_wrap` (for the current org key), and their active public `keys` — so the CLI can
+> re-wrap on rotate. **All server endpoints are now in place; nothing server-side remains.**
+> Client follow-up: un-stub `p3sig org rotate` in `org_cli.go` (open all secrets →
+> `rotateOrgVault` in org.go → POST `rotateOrgVault` with sealed+wraps; re-wrap only
+> members where `has_wrap` is true). The original spec is kept below for reference.
 
 > **Provenance / handoff.** Filed by the **Windows CLI session** — the one that landed
 > T4 (Windows Hello ECDH, `keystore_windows.go` `7d593a2`) and the Org Vault **client

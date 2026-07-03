@@ -72,6 +72,7 @@ code path, no weaker/second pattern. CLI clients send `pubkey`/`ts`/`signature` 
 - `getSealedSecret {secret_id}` → `{label, provider, encrypted_data, wrapped_org_key}` — the org-key copy + caller's wrap, to open in-client.
 - `revokeOrgSecret {secret_id}` (admin).
 - `listOrgSecrets` → `{secrets:[{secret_id, label, provider}]}` — metadata only; the name→id map for `org secret get NAME`.
+- `listOrgMembers` (admin) → `{members:[{user_id, role, status, has_wrap, keys:[{key_id, public_key}]}]}` — the roster `org rotate` re-wraps to (re-wrap where `has_wrap`).
 - Member mgmt (memberActions, also on the API endpoint): `createOrg {name, org_public_key, wrapped_org_key, owner_key_id}`, `addMember {email, role}` (registered accounts only — no invites), `wrapOrgKeyForMember {member_user_id, member_key_id, wrapped_org_key}`, `changeMemberRole`, `removeMember`, `rotateOrgVault {new_org_public_key, sealed:JSON, wraps:JSON}`.
 
 ## Schema (server, FYI) — `include/common/schemaFunctions.php`
