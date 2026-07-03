@@ -1,0 +1,62 @@
+name: CI
+
+# Build/vet/gofmt/test on every push + PR, matrixed across the three OSes we ship.
+# The whole point: a change that breaks the darwin build (or windows) is caught in
+# minutes here, so physical Mac/Windows sessions shrink to JUST the biometric test.
+# Hardware tests (Touch ID / Windows Hello) self-skip unless P3SIG_HW_TEST /
+# P3SIG_TOUCHID_TEST / P3SIG_HELLO_TEST is set, so a plain `go test ./...` is safe
+# and device-free here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build/vet/test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          check-latest: true
+
+      # cgo on macOS (keystore_darwin.go → Security.framework) needs the SDK path.
+      # Compilation does NOT need code signing — only RUNNING Enclave ops does.
+      - name: Set macOS SDKROOT (cgo)
+        if: runner.os == 'macOS'
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+
+      # gofmt is platform-independent; run it once (bash) on the unix runners.
+      - name: gofmt
+        if: runner.os != 'Windows'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on these files (run: gofmt -w .):"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (hardware tests self-skip without P3SIG_HW_TEST)
+        run: go test ./...
