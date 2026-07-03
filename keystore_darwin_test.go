@@ -130,3 +130,59 @@ func TestSignRoundTrip(t *testing.T) {
 	}
 	t.Log("OK: Secure Enclave signature verified against the exported public key")
 }
+
+// TestSecureEnclave_CreateAgreementKeyRoundTrip verifies T12: on macOS
+// CreateAgreementKey reuses the single SE key and returns its SEC1 point, and that
+// point is exactly the one Agree unwraps with. Wraps a secret to the returned point
+// and recovers it through Agree. Pops Touch ID (create + agree); opt in with:
+//
+//	P3SIG_HW_TEST=1 go test -run TestSecureEnclave_CreateAgreementKeyRoundTrip -v
+func TestSecureEnclave_CreateAgreementKeyRoundTrip(t *testing.T) {
+	if os.Getenv("P3SIG_HW_TEST") == "" {
+		t.Skip("interactive (Touch ID) — set P3SIG_HW_TEST=1 to run")
+	}
+	ks := secureEnclave{}
+	label := "p3sig-test-agreekey"
+	defer ks.Delete(label)
+
+	t.Log("approve the Touch ID prompt to create the throwaway key...")
+	line, err := ks.Create(label)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	sec1, err := ks.CreateAgreementKey(label)
+	if err != nil {
+		t.Fatalf("CreateAgreementKey: %v", err)
+	}
+	if len(sec1) != 65 || sec1[0] != 0x04 {
+		t.Fatalf("agreement pubkey not a 65-byte uncompressed SEC1 point (%d bytes)", len(sec1))
+	}
+	// The returned point must be the SE key Create made — macOS reuses one key.
+	if want := sshPubToECDH(t, line).Bytes(); !bytes.Equal(sec1, want) {
+		t.Fatalf("CreateAgreementKey point != the SE key's point\n got %x\nwant %x", sec1, want)
+	}
+
+	// Wrap to the returned point, then unwrap through Agree — proves the point
+	// CreateAgreementKey hands out is the one Agree actually unwraps with.
+	chipPub, err := ecdh.P256().NewPublicKey(sec1)
+	if err != nil {
+		t.Fatalf("parse SEC1 point: %v", err)
+	}
+	secret := bytes.Repeat([]byte{0x5a}, 32)
+	blob, err := WrapECDH(secret, chipPub)
+	if err != nil {
+		t.Fatalf("WrapECDH: %v", err)
+	}
+	t.Log("approve the Touch ID prompt to unwrap (ECDH)...")
+	got, err := UnwrapECDH(blob, func(eph []byte) ([]byte, error) {
+		return ks.Agree(label, eph)
+	})
+	if err != nil {
+		t.Fatalf("UnwrapECDH: %v", err)
+	}
+	if !bytes.Equal(got, secret) {
+		t.Fatalf("round-trip mismatch: got %x want %x", got, secret)
+	}
+	t.Log("OK: CreateAgreementKey point matches the SE key and round-trips through Agree")
+}
