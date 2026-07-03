@@ -33,7 +33,6 @@ import (
 	"time"
 
 	"filippo.io/edwards25519"
-	"golang.org/x/crypto/nacl/box"
 )
 
 const httpTimeout = 20 * time.Second
@@ -416,21 +415,11 @@ func postForm(apiBase string, form url.Values, v any) error {
 // Ed25519 private key (converted to X25519). Wire-compatible with PHP's
 // sodium_crypto_box_seal / Go's box.OpenAnonymous.
 func openSealedBox(encryptedB64 string, edPriv ed25519.PrivateKey) (string, error) {
-	ciphertext, err := base64.StdEncoding.DecodeString(encryptedB64)
+	raw, err := openSealedBoxRaw(encryptedB64, edPriv)
 	if err != nil {
-		return "", fmt.Errorf("invalid base64: %w", err)
+		return "", err
 	}
-	edPub := edPriv.Public().(ed25519.PublicKey)
-	x25519Pub, err := ed25519PubToX25519(edPub)
-	if err != nil {
-		return "", fmt.Errorf("public key conversion: %w", err)
-	}
-	x25519Priv := ed25519PrivToX25519(edPriv)
-	plaintext, ok := box.OpenAnonymous(nil, ciphertext, x25519Pub, x25519Priv)
-	if !ok {
-		return "", fmt.Errorf("decryption failed — wrong key or corrupted ciphertext")
-	}
-	return string(plaintext), nil
+	return string(raw), nil
 }
 
 func ed25519PubToX25519(edPub ed25519.PublicKey) (*[32]byte, error) {

@@ -9,7 +9,6 @@ package main
 import (
 	"bufio"
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -20,8 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"golang.org/x/crypto/nacl/box"
 )
 
 // ─── config + profiles ──────────────────────────────────────────────────────
@@ -502,23 +499,12 @@ func userRequest(apiBase, action, keyPath string, extra url.Values, v any) error
 	return postForm(apiBase, form, v)
 }
 
-// sealForKey seals plaintext to a base64 Ed25519 public key, producing a base64
-// libsodium sealed box (crypto_box_seal) — the inverse of openSealedBox, and
-// what p3sig stores. Wire-compatible with PHP's sodium_crypto_box_seal.
+// sealForKey seals a UTF-8 string to a base64 Ed25519 public key, producing a base64
+// libsodium sealed box (crypto_box_seal) — the inverse of openSealedBox, and what
+// p3sig stores. Wire-compatible with PHP's sodium_crypto_box_seal. Thin string wrapper
+// over sealForKeyRaw (org.go).
 func sealForKey(plaintext, edPubB64 string) (string, error) {
-	edPub, err := base64.StdEncoding.DecodeString(strings.TrimSpace(edPubB64))
-	if err != nil || len(edPub) != ed25519.PublicKeySize {
-		return "", fmt.Errorf("invalid recipient public key")
-	}
-	xPub, err := ed25519PubToX25519(ed25519.PublicKey(edPub))
-	if err != nil {
-		return "", err
-	}
-	sealed, err := box.SealAnonymous(nil, []byte(plaintext), xPub, rand.Reader)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(sealed), nil
+	return sealForKeyRaw([]byte(plaintext), edPubB64)
 }
 
 // ─── p3sig login — establish the account identity ───────────────────────────
