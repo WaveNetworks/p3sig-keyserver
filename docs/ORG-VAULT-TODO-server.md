@@ -1,5 +1,16 @@
 # Org Vault — server (PHP) TODO: signed-request endpoints for native CLI clients
 
+> **✅ DONE — 2026-07-03.** The main session implemented this in `WaveNetworks/p3sig`
+> commit **`8bb04f6f`** ("Org API: one dual-source auth resolver so the native CLI can
+> authenticate"): a single `p3sig_org_actor()` resolver (new `include/common/
+> userRequestAuth.php`, session-or-signed-request), every org action switched to it
+> (management verbs included), plus the new `listOrgSecrets` endpoint. Verified by review
+> against this spec. The client verbs are now built — `p3sig org create/add/grant/secret
+> set|get|list` in `org_cli.go`. **One remaining server item:** a `listOrgSecrets`-style
+> **`listOrgMembers`** endpoint is still needed for `p3sig org rotate` (the CLI can't
+> enumerate members to re-wrap); until then, rotate from the web UI. The original spec is
+> kept below for reference.
+
 > **Provenance / handoff.** Filed by the **Windows CLI session** — the one that landed
 > T4 (Windows Hello ECDH, `keystore_windows.go` `7d593a2`) and the Org Vault **client
 > crypto core** `org.go` (`fe7fa8d`, this repo). While wiring the `p3sig org …` verbs I

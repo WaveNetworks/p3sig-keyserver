@@ -117,6 +117,40 @@ func main() {
 		default:
 			err = fmt.Errorf("unknown secret subcommand %q (set | get)", os.Args[2])
 		}
+	case "org":
+		if len(os.Args) < 3 {
+			err = fmt.Errorf("usage: p3sig org create|add|grant|secret|rotate  (run `p3sig help`)")
+			break
+		}
+		rest := os.Args[3:]
+		switch os.Args[2] {
+		case "create":
+			err = cmdOrgCreate(parseFlags(rest))
+		case "add":
+			err = cmdOrgAddMember(parseFlags(rest))
+		case "grant":
+			err = cmdOrgGrant(parseFlags(rest))
+		case "secret":
+			if len(os.Args) < 4 {
+				err = fmt.Errorf("usage: p3sig org secret set|get|list [NAME]")
+				break
+			}
+			srest := os.Args[4:]
+			switch os.Args[3] {
+			case "set":
+				err = cmdOrgSecretSet(parseFlags(srest), firstPositional(srest))
+			case "get":
+				err = cmdOrgSecretGet(parseFlags(srest), firstPositional(srest))
+			case "list":
+				err = cmdOrgSecretList(parseFlags(srest))
+			default:
+				err = fmt.Errorf("unknown org secret subcommand %q (set | get | list)", os.Args[3])
+			}
+		case "rotate":
+			err = fmt.Errorf("org rotate isn't available from the CLI yet — it needs a listOrgMembers server endpoint to enumerate members for re-wrapping (see docs/ORG-VAULT-TODO-server.md). Rotate from the web UI for now")
+		default:
+			err = fmt.Errorf("unknown org subcommand %q (create | add | grant | secret)", os.Args[2])
+		}
 	case "setup":
 		err = cmdSetup(parseFlags(os.Args[2:]))
 	case "ssh-agent":
@@ -537,6 +571,14 @@ MANAGE (your account — signs with your vault USB key)
                              Store a secret: sealed to your keys CLIENT-SIDE, only
                              ciphertext uploaded. Value via stdin or prompt (never argv).
   p3sig secret get NAME      Fetch + unseal one of your secrets locally.
+
+ORG VAULT (enterprise — shared, zero-knowledge; signs with your vault key)
+  p3sig org create --name NAME     Create an organization + its vault (client-side keypair).
+  p3sig org add --email A [--admin] Add a registered account to the org (member or admin).
+  p3sig org grant --user ID        Give a member vault access (wraps the org key to them).
+  p3sig org secret set NAME        Store an org secret (sealed to the org key; stdin/prompt).
+  p3sig org secret get NAME        Fetch + open an org secret you have access to.
+  p3sig org secret list            List org secret names.
 
 SSH (certificate authority)
   p3sig agent pull           Write TrustedUserCAKeys, AuthorizedPrincipalsFile/<user>, RevokedKeys.
