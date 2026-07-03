@@ -346,6 +346,12 @@ func (secureEnclave) Sign(label string, data []byte) ([]byte, error) {
 	return sig, nil // ASN.1 DER; agent.go normalizeECDSASig handles it
 }
 
+// CreateAgreementKey — see the Keystore interface. Real implementation lands in
+// the T12 darwin PR; this stub keeps the darwin build satisfying the interface.
+func (secureEnclave) CreateAgreementKey(label string) ([]byte, error) {
+	return nil, fmt.Errorf("secure enclave: CreateAgreementKey not implemented yet (T12)")
+}
+
 // Agree performs ECDH between the Secure Enclave key for label and peerPubSEC1
 // (a peer/ephemeral public key as a 65-byte uncompressed SEC1 point, 0x04||X||Y),
 // prompting Touch ID. It returns the 32-byte big-endian X coordinate of the

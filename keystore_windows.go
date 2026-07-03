@@ -192,9 +192,9 @@ func (winHello) Sign(label string, data []byte) ([]byte, error) {
 // agreement requires an NCRYPT_ECDH_P256_ALGORITHM key. The two live under distinct
 // container names (<label> for signing, <label>-ecdh for agreement).
 //
-// NB: this is intentionally a concrete method on winHello, not (yet) part of the
-// Keystore interface — promoting it would require a matching darwin implementation,
-// which T3 owns. Promote it to the interface once the macOS side lands.
+// CreateAgreementKey is part of the Keystore interface (promoted in T12, once the
+// macOS Secure Enclave side landed). Windows needs a dedicated <label>-ecdh key
+// because CNG signing keys can't do ECDH; macOS reuses its single SE key instead.
 func (winHello) CreateAgreementKey(label string) ([]byte, error) {
 	// Refuse to clobber an existing ECDH key — let the user --delete first.
 	if prov, key, _, err := openExistingKeyByName(agreeName(label)); err == nil {
