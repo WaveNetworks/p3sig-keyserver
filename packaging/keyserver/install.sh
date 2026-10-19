@@ -29,6 +29,7 @@ if [ ! -f /etc/p3sig/keyserver.json ]; then
 {
   "label": "keyserver",
   "client_ip_header": "X-Forwarded-For",
+  "events_file": "/var/lib/p3sig-keyserver/events.jsonl",
   "apps": {}
 }
 EOF
@@ -47,5 +48,6 @@ systemctl enable --now p3sig-keyserver
 systemctl restart p3sig-keyserver
 
 echo "key server running on 127.0.0.1:8787"
+echo "how often apps need it: sudo -u p3sig-ks p3sig keyserver stats --config /etc/p3sig/keyserver.json"
 echo "chip public point (apps wrap their bundle key to this; also in /etc/p3sig/keyserver.pub):"
 echo "$POINT"
