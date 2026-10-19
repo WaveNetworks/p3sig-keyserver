@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -145,7 +146,7 @@ func cmdRestore(f map[string]string) error {
 		raw = string(b)
 	} else {
 		fmt.Println("Paste the recovery card (including the BEGIN/END lines), then Ctrl-D:")
-		b, _ := os.ReadFile("/dev/stdin")
+		b, _ := io.ReadAll(os.Stdin)
 		raw = string(b)
 	}
 

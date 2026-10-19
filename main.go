@@ -147,9 +147,9 @@ func main() {
 				err = fmt.Errorf("unknown org secret subcommand %q (set | get | list)", os.Args[3])
 			}
 		case "rotate":
-			err = fmt.Errorf("org rotate isn't available from the CLI yet — it needs a listOrgMembers server endpoint to enumerate members for re-wrapping (see docs/ORG-VAULT-TODO-server.md). Rotate from the web UI for now")
+			err = cmdOrgRotate(parseFlags(rest))
 		default:
-			err = fmt.Errorf("unknown org subcommand %q (create | add | grant | secret)", os.Args[2])
+			err = fmt.Errorf("unknown org subcommand %q (create | add | grant | secret | rotate)", os.Args[2])
 		}
 	case "setup":
 		err = cmdSetup(parseFlags(os.Args[2:]))
@@ -367,21 +367,28 @@ func fetchSecrets(apiBase, machine string, key ed25519.PrivateKey, bundle string
 	}
 	var res struct {
 		Secrets []struct {
-			Label     string `json:"label"`
+			SecretID  string `json:"secret_id"`
 			Encrypted string `json:"encrypted_data"`
+			Meta      string `json:"encrypted_meta"`
 		} `json:"secrets"`
 	}
 	if err := pullInto(apiBase, "getSealedSecrets", machine, key, extra, &res); err != nil {
 		return nil, err
 	}
+	// The variable name is sealed next to the value; open both with this machine's key.
 	out := make([][2]string, 0, len(res.Secrets))
 	for _, s := range res.Secrets {
+		name, err := openSecretName(s.Meta, key)
+		if err != nil {
+			return nil, fmt.Errorf("open the name of secret %s: %w", s.SecretID, err)
+		}
 		val, err := openSealedBox(s.Encrypted, key)
 		if err != nil {
-			return nil, fmt.Errorf("unseal %s: %w", s.Label, err)
+			return nil, fmt.Errorf("unseal %s: %w", name.Label, err)
 		}
-		out = append(out, [2]string{s.Label, val})
+		out = append(out, [2]string{name.Label, val})
 	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i][0] < out[j][0] })
 	return out, nil
 }
 
@@ -568,17 +575,21 @@ MANAGE (your account — signs with your vault USB key)
   p3sig login --key VAULTKEY  Prove your account with your vault key; save an identity.
                              The account is whoever owns the key — nothing typed.
   p3sig secret set NAME [--type personal|developer] [--provider P] [--bundle ID]
-                             Store a secret: sealed to your keys CLIENT-SIDE, only
-                             ciphertext uploaded. Value via stdin or prompt (never argv).
+                             Store a secret: value AND name sealed to your keys
+                             CLIENT-SIDE, only ciphertext uploaded. Value via stdin or
+                             prompt (never argv). Machines granted the bundle get it when
+                             you re-seal in the browser (Seal now).
   p3sig secret get NAME      Fetch + unseal one of your secrets locally.
 
 ORG VAULT (enterprise — shared, zero-knowledge; signs with your vault key)
   p3sig org create --name NAME     Create an organization + its vault (client-side keypair).
   p3sig org add --email A [--admin] Add a registered account to the org (member or admin).
-  p3sig org grant --user ID        Give a member vault access (wraps the org key to them).
-  p3sig org secret set NAME        Store an org secret (sealed to the org key; stdin/prompt).
+  p3sig org grant --user ID        Give a member vault access (wraps the org key to every
+                                   one of their keys).
+  p3sig org secret set NAME        Store an org secret (value + name sealed to the org key).
   p3sig org secret get NAME        Fetch + open an org secret you have access to.
-  p3sig org secret list            List org secret names.
+  p3sig org secret list            List org secret names (opened locally with the org key).
+  p3sig org rotate                 New org key: re-seal every secret, re-wrap to members.
 
 SSH (certificate authority)
   p3sig agent pull           Write TrustedUserCAKeys, AuthorizedPrincipalsFile/<user>, RevokedKeys.

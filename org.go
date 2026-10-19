@@ -127,10 +127,12 @@ type OrgMemberKey struct {
 	Pub    string `json:"public_key"`
 }
 
-// OrgSecretCopy is a secret's copy sealed to the OLD org key (rotate re-seals it).
+// OrgSecretCopy is a secret's copy sealed to the OLD org key (rotate re-seals it):
+// the value and its sealed name.
 type OrgSecretCopy struct {
 	SecretID string `json:"secret_id"`
 	Enc      string `json:"encrypted_data"`
+	Meta     string `json:"encrypted_meta"`
 }
 
 // SealedSecret is a secret re-sealed to the NEW org key. Carries no key_id — the new
@@ -138,6 +140,7 @@ type OrgSecretCopy struct {
 type SealedSecret struct {
 	SecretID string `json:"secret_id"`
 	Enc      string `json:"encrypted_data"`
+	Meta     string `json:"encrypted_meta"`
 }
 
 // MemberWrap is the org private key re-wrapped to one remaining member.
@@ -161,15 +164,19 @@ type RotateResult struct {
 // old ciphertext opens). Mirrors P3Crypto.rotate. The caller uploads NewOrgPub / Sealed
 // / Wraps via rotateOrgVault; the old key is revoked server-side.
 func rotateOrgVault(orgPriv ed25519.PrivateKey, members []OrgMemberKey, secrets []OrgSecretCopy) (*RotateResult, error) {
-	// Decrypt all current secrets with the OLD org key first.
-	type kv struct{ id, val string }
+	// Decrypt all current secrets (value + name) with the OLD org key first.
+	type kv struct{ id, val, meta string }
 	plain := make([]kv, 0, len(secrets))
 	for _, s := range secrets {
 		v, err := openOrgSecret(s.Enc, orgPriv)
 		if err != nil {
 			return nil, fmt.Errorf("open secret %s under current org key: %w", s.SecretID, err)
 		}
-		plain = append(plain, kv{s.SecretID, v})
+		m, err := openOrgSecret(s.Meta, orgPriv)
+		if err != nil {
+			return nil, fmt.Errorf("open the name of secret %s under current org key: %w", s.SecretID, err)
+		}
+		plain = append(plain, kv{s.SecretID, v, m})
 	}
 
 	newPub, newPriv, err := ed25519.GenerateKey(nil)
@@ -184,7 +191,11 @@ func rotateOrgVault(orgPriv ed25519.PrivateKey, members []OrgMemberKey, secrets 
 		if err != nil {
 			return nil, err
 		}
-		sealed = append(sealed, SealedSecret{SecretID: p.id, Enc: enc})
+		meta, err := sealForKeyRaw([]byte(p.meta), newPubB64)
+		if err != nil {
+			return nil, err
+		}
+		sealed = append(sealed, SealedSecret{SecretID: p.id, Enc: enc, Meta: meta})
 	}
 
 	wraps := make([]MemberWrap, 0, len(members))

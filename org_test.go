@@ -142,7 +142,11 @@ func TestRotateOrgVault(t *testing.T) {
 		if err != nil {
 			t.Fatalf("seal %s: %v", id, err)
 		}
-		copies = append(copies, OrgSecretCopy{SecretID: id, Enc: enc})
+		meta, err := sealForKey(`{"label":"`+id+`","provider":""}`, orgPubB64)
+		if err != nil {
+			t.Fatalf("seal name %s: %v", id, err)
+		}
+		copies = append(copies, OrgSecretCopy{SecretID: id, Enc: enc, Meta: meta})
 	}
 
 	members := []OrgMemberKey{{UserID: "u-member", KeyID: "k1", Pub: memberPub}}
@@ -166,6 +170,10 @@ func TestRotateOrgVault(t *testing.T) {
 		}
 		if got != secrets[s.SecretID] {
 			t.Fatalf("re-sealed %s = %q, want %q", s.SecretID, got, secrets[s.SecretID])
+		}
+		name, err := openSecretName(s.Meta, res.NewOrgPriv)
+		if err != nil || name.Label != s.SecretID {
+			t.Fatalf("re-sealed name of %s = %+v, %v", s.SecretID, name, err)
 		}
 		// The OLD ciphertext must not open under the NEW key.
 		for _, old := range copies {

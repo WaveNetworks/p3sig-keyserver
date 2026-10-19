@@ -1,5 +1,11 @@
 # Org Vault — CLI (`org_cli.go`) TODO: wrap to ALL keys, try ALL wraps
 
+> **DONE 2026-10-19 (v0.6.0).** All four gaps are fixed in `org_cli.go`: create and grant wrap
+> to every key, rotate (`p3sig org rotate`, now implemented) re-wraps every key of members
+> with access, and reads try every wrap (`myOrgKey`). Org secret names are also sealed now
+> (`encrypted_meta`), so `list`/`get` open names locally with the org key.
+
+
 > **Provenance.** Filed by the p3sig server/main session after fixing the **browser** to
 > wrap the org key to *all* of a user's personal keys (p3sig `a3cccb8`). The native CLI
 > still wraps to **one** key — the same single-point-of-failure the browser just shed.

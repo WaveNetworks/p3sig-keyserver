@@ -8,8 +8,12 @@ package main
 //
 // Auth: every call signs "<pubkey>|<ts>" with the account's vault key (userRequest);
 // the server resolves the account and org membership from that key (p3sig_org_actor).
-// The SAME vault key doubles as the personal key that unwraps the org key — so it must
-// be the key the org wrap was sealed to (the common single-key case).
+// The SAME vault key doubles as the personal key that unwraps the org key. The org key
+// is wrapped to EVERY one of a member's keys (as the browser does), and reads try every
+// wrap, so whichever of your keys you use opens it.
+//
+// Names are sealed too: every org secret's {label, provider} JSON is sealed to the org
+// key next to its value (encrypted_meta); the server keeps no readable name.
 
 import (
 	"crypto/ed25519"
@@ -18,6 +22,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 )
 
 // ─── org create ─────────────────────────────────────────────────────────────
@@ -58,7 +63,18 @@ func cmdOrgCreate(f map[string]string) error {
 	if err := userRequest(apiBase, "createOrg", keyPath, extra, &res); err != nil {
 		return err
 	}
-	fmt.Printf("created organization %q (org_id %s). Your Org Vault is ready.\n", name, res.OrgID)
+	// Wrap the org key to your OTHER keys too, so losing this one never locks you out.
+	var who struct {
+		UserID json.Number `json:"user_id"`
+	}
+	if err := userRequest(apiBase, "whoami", keyPath, nil, &who); err != nil {
+		return fmt.Errorf("org created, but wrapping it to your other keys failed (grant yourself from the web): %w", err)
+	}
+	n, err := wrapToAllKeys(apiBase, keyPath, orgPriv, who.UserID.String(), "getMyVaultKeys", nil, ownerKeyID)
+	if err != nil {
+		return fmt.Errorf("org created, but wrapping it to your other keys failed (grant yourself from the web): %w", err)
+	}
+	fmt.Printf("created organization %q (org_id %s). Your Org Vault is ready, secured to %d of your keys.\n", name, res.OrgID, n+1)
 	fmt.Println("Next:  p3sig org secret set NAME   ·   p3sig org add --email teammate@example.com")
 	return nil
 }
@@ -115,32 +131,46 @@ func cmdOrgGrant(f map[string]string) error {
 
 	extra := url.Values{}
 	extra.Set("member_user_id", memberID)
-	var mk struct {
-		Keys []orgKeyRef `json:"keys"`
-	}
-	if err := userRequest(apiBase, "getMemberKeys", keyPath, extra, &mk); err != nil {
-		return err
-	}
-	if len(mk.Keys) == 0 {
-		return fmt.Errorf("member %s has no active personal key to wrap the org key to", memberID)
-	}
-	target := mk.Keys[0] // match the web client: wrap to the member's first active key
-	wrapped, err := wrapOrgKeyFor(orgPriv, target.Pub)
+	n, err := wrapToAllKeys(apiBase, keyPath, orgPriv, memberID, "getMemberKeys", extra, "")
 	if err != nil {
 		return err
 	}
-	w := url.Values{}
-	w.Set("member_user_id", memberID)
-	w.Set("member_key_id", target.KeyID)
-	w.Set("wrapped_org_key", wrapped)
-	if err := userRequest(apiBase, "wrapOrgKeyForMember", keyPath, w, nil); err != nil {
-		return err
+	if n == 0 {
+		return fmt.Errorf("member %s has no active personal key to wrap the org key to", memberID)
 	}
-	fmt.Printf("granted vault access to user %s.\n", memberID)
-	if len(mk.Keys) > 1 {
-		fmt.Printf("note: member has %d keys; wrapped to the first only (matches the web client).\n", len(mk.Keys))
-	}
+	fmt.Printf("granted vault access to user %s (wrapped to %d key(s)).\n", memberID, n)
 	return nil
+}
+
+// wrapToAllKeys wraps the org key to every active key a lookup action returns
+// (getMyVaultKeys / getMemberKeys) except skipKeyID, storing each wrap for
+// memberID. → the number of wraps stored.
+func wrapToAllKeys(apiBase, keyPath string, orgPriv ed25519.PrivateKey, memberID, lookup string, lookupArgs url.Values, skipKeyID string) (int, error) {
+	var mk struct {
+		Keys []orgKeyRef `json:"keys"`
+	}
+	if err := userRequest(apiBase, lookup, keyPath, lookupArgs, &mk); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, k := range mk.Keys {
+		if k.KeyID == skipKeyID {
+			continue
+		}
+		wrapped, err := wrapOrgKeyFor(orgPriv, k.Pub)
+		if err != nil {
+			return n, err
+		}
+		w := url.Values{}
+		w.Set("member_user_id", memberID)
+		w.Set("member_key_id", k.KeyID)
+		w.Set("wrapped_org_key", wrapped)
+		if err := userRequest(apiBase, "wrapOrgKeyForMember", keyPath, w, nil); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
 }
 
 // ─── org secret set / get / list ────────────────────────────────────────────
@@ -167,25 +197,18 @@ func cmdOrgSecretSet(f map[string]string, name string) error {
 	if err != nil {
 		return err
 	}
-	type copyT struct {
-		KeyID string `json:"key_id"`
-		Enc   string `json:"encrypted_data"`
-	}
-	copies := make([]copyT, 0, len(rec.Recipients))
+	meta := secretMeta{Label: name, Provider: f["provider"]}
+	copies := make([]sealedCopy, 0, len(rec.Recipients))
 	for _, r := range rec.Recipients {
-		enc, err := sealForKey(value, r.Pub)
+		c, err := sealSecretFor(value, meta, r.KeyID, r.Pub)
 		if err != nil {
 			return fmt.Errorf("seal to org key %s: %w", r.KeyID, err)
 		}
-		copies = append(copies, copyT{KeyID: r.KeyID, Enc: enc})
+		copies = append(copies, c)
 	}
 	payload, _ := json.Marshal(copies)
 
 	extra := url.Values{}
-	extra.Set("label", name)
-	if f["provider"] != "" {
-		extra.Set("provider", f["provider"])
-	}
 	if f["bundle"] != "" {
 		extra.Set("bundle_id", f["bundle"])
 	}
@@ -197,7 +220,10 @@ func cmdOrgSecretSet(f map[string]string, name string) error {
 	if err := userRequest(apiBase, "saveSealedSecret", keyPath, extra, &res); err != nil {
 		return err
 	}
-	fmt.Printf("stored org secret %q — sealed to the org vault key; the server holds only ciphertext.\n", name)
+	fmt.Printf("stored org secret %q — value and name sealed to the org vault key; the server holds only ciphertext.\n", name)
+	if f["bundle"] != "" {
+		fmt.Println("machines already granted that bundle get it when an admin re-seals (web: the machine's page).")
+	}
 	return nil
 }
 
@@ -213,24 +239,33 @@ func cmdOrgSecretGet(f map[string]string, name string) error {
 	if err != nil {
 		return err
 	}
-	secretID, err := resolveOrgSecretID(apiBase, keyPath, name)
+	orgPriv, err := myOrgKey(apiBase, keyPath, key)
 	if err != nil {
 		return err
+	}
+	defer zero(orgPriv)
+	named, err := orgSecretNames(apiBase, keyPath, orgPriv)
+	if err != nil {
+		return err
+	}
+	secretID := ""
+	for _, n := range named {
+		if n.Label == name {
+			secretID = n.SecretID
+			break
+		}
+	}
+	if secretID == "" {
+		return fmt.Errorf("no org secret named %q", name)
 	}
 	extra := url.Values{}
 	extra.Set("secret_id", secretID)
 	var res struct {
-		Enc     string `json:"encrypted_data"`
-		Wrapped string `json:"wrapped_org_key"`
+		Enc string `json:"encrypted_data"`
 	}
 	if err := userRequest(apiBase, "getSealedSecret", keyPath, extra, &res); err != nil {
 		return err
 	}
-	orgPriv, err := unwrapOrgKey(res.Wrapped, key)
-	if err != nil {
-		return fmt.Errorf("unwrap org key (is your vault key the one access was granted to?): %w", err)
-	}
-	defer zero(orgPriv)
 	val, err := openOrgSecret(res.Enc, orgPriv)
 	if err != nil {
 		return fmt.Errorf("open %q: %w", name, err)
@@ -244,17 +279,106 @@ func cmdOrgSecretList(f map[string]string) error {
 	if err != nil {
 		return err
 	}
-	secrets, err := fetchOrgSecrets(apiBase, keyPath)
+	key, err := loadKey(keyPath)
 	if err != nil {
 		return err
 	}
-	if len(secrets) == 0 {
+	orgPriv, err := myOrgKey(apiBase, keyPath, key)
+	if err != nil {
+		return err
+	}
+	defer zero(orgPriv)
+	named, err := orgSecretNames(apiBase, keyPath, orgPriv)
+	if err != nil {
+		return err
+	}
+	if len(named) == 0 {
 		fmt.Fprintln(os.Stderr, "(no org secrets)")
 		return nil
 	}
-	for _, s := range secrets {
-		fmt.Println(s.Label)
+	for _, n := range named {
+		if n.Bundle != "" {
+			fmt.Printf("%s\t(%s)\n", n.Label, n.Bundle)
+		} else {
+			fmt.Println(n.Label)
+		}
 	}
+	return nil
+}
+
+// ─── org rotate ─────────────────────────────────────────────────────────────
+
+// cmdOrgRotate replaces the org vault key: every secret (value + name) is re-sealed
+// to a new org key and the new key is wrapped to every key of each member who has
+// access now. All crypto happens here; the server checks nothing is lost.
+func cmdOrgRotate(f map[string]string) error {
+	apiBase, keyPath, err := resolveIdentity(f)
+	if err != nil {
+		return err
+	}
+	key, err := loadKey(keyPath)
+	if err != nil {
+		return err
+	}
+	orgPriv, err := myOrgKey(apiBase, keyPath, key)
+	if err != nil {
+		return err
+	}
+	defer zero(orgPriv)
+
+	list, err := fetchOrgSecrets(apiBase, keyPath)
+	if err != nil {
+		return err
+	}
+	copies := make([]OrgSecretCopy, 0, len(list))
+	for _, s := range list {
+		extra := url.Values{}
+		extra.Set("secret_id", s.SecretID)
+		var res struct {
+			Enc  string `json:"encrypted_data"`
+			Meta string `json:"encrypted_meta"`
+		}
+		if err := userRequest(apiBase, "getSealedSecret", keyPath, extra, &res); err != nil {
+			return fmt.Errorf("fetch secret %s (nothing was rotated): %w", s.SecretID, err)
+		}
+		copies = append(copies, OrgSecretCopy{SecretID: s.SecretID, Enc: res.Enc, Meta: res.Meta})
+	}
+
+	var mem struct {
+		Members []struct {
+			UserID  json.Number `json:"user_id"`
+			HasWrap bool        `json:"has_wrap"`
+			Keys    []orgKeyRef `json:"keys"`
+		} `json:"members"`
+	}
+	if err := userRequest(apiBase, "listOrgMembers", keyPath, nil, &mem); err != nil {
+		return err
+	}
+	var members []OrgMemberKey
+	for _, m := range mem.Members {
+		if !m.HasWrap { // preserve access, don't silently grant
+			continue
+		}
+		for _, k := range m.Keys {
+			members = append(members, OrgMemberKey{UserID: m.UserID.String(), KeyID: k.KeyID, Pub: k.Pub})
+		}
+	}
+
+	rot, err := rotateOrgVault(orgPriv, members, copies)
+	if err != nil {
+		return err
+	}
+	defer zero(rot.NewOrgPriv)
+	sealed, _ := json.Marshal(rot.Sealed)
+	wraps, _ := json.Marshal(rot.Wraps)
+	extra := url.Values{}
+	extra.Set("new_org_public_key", rot.NewOrgPub)
+	extra.Set("sealed", string(sealed))
+	extra.Set("wraps", string(wraps))
+	if err := userRequest(apiBase, "rotateOrgVault", keyPath, extra, nil); err != nil {
+		return err
+	}
+	fmt.Printf("rotated the org vault: %d secret(s) re-sealed, %d key wrap(s) for current members.\n", len(rot.Sealed), len(rot.Wraps))
 	return nil
 }
 
@@ -267,11 +391,18 @@ type orgKeyRef struct {
 	Pub   string `json:"public_key"`
 }
 
-// orgSecretMeta is one row from listOrgSecrets.
-type orgSecretMeta struct {
+// orgSecretRow is one row from listOrgSecrets: the name is sealed to the org key.
+type orgSecretRow struct {
 	SecretID string `json:"secret_id"`
-	Label    string `json:"label"`
-	Provider string `json:"provider"`
+	Bundle   string `json:"bundle"`
+	Meta     string `json:"encrypted_meta"`
+}
+
+// orgSecretName is an org secret with its name opened.
+type orgSecretName struct {
+	SecretID string
+	Bundle   string
+	secretMeta
 }
 
 // findMyKeyID resolves the caller's own vault key_id (needed as owner_key_id when
@@ -291,26 +422,31 @@ func findMyKeyID(apiBase, keyPath, pubB64 string) (string, error) {
 	return "", fmt.Errorf("this vault key is not registered on the account")
 }
 
-// myOrgKey fetches the caller's own wrapped org key and unwraps it with their personal
-// vault key, returning the held org private key.
+// myOrgKey fetches the caller's wraps of the org key and opens whichever was sealed
+// to this personal vault key (the org key is wrapped to every one of your keys).
 func myOrgKey(apiBase, keyPath string, personalPriv ed25519.PrivateKey) (ed25519.PrivateKey, error) {
 	var res struct {
-		Wrap *struct {
+		Wraps []struct {
 			Wrapped string `json:"wrapped_org_key"`
-		} `json:"wrap"`
+		} `json:"wraps"`
 	}
 	if err := userRequest(apiBase, "getOrgKeyWrap", keyPath, nil, &res); err != nil {
 		return nil, err
 	}
-	if res.Wrap == nil || res.Wrap.Wrapped == "" {
+	if len(res.Wraps) == 0 {
 		return nil, fmt.Errorf("you don't have vault access yet — ask an admin to grant it")
 	}
-	return unwrapOrgKey(res.Wrap.Wrapped, personalPriv)
+	for _, w := range res.Wraps {
+		if k, err := unwrapOrgKey(w.Wrapped, personalPriv); err == nil {
+			return k, nil
+		}
+	}
+	return nil, fmt.Errorf("none of your org key wraps opens with this vault key — ask an admin to grant access to it")
 }
 
-func fetchOrgSecrets(apiBase, keyPath string) ([]orgSecretMeta, error) {
+func fetchOrgSecrets(apiBase, keyPath string) ([]orgSecretRow, error) {
 	var res struct {
-		Secrets []orgSecretMeta `json:"secrets"`
+		Secrets []orgSecretRow `json:"secrets"`
 	}
 	if err := userRequest(apiBase, "listOrgSecrets", keyPath, nil, &res); err != nil {
 		return nil, err
@@ -318,15 +454,21 @@ func fetchOrgSecrets(apiBase, keyPath string) ([]orgSecretMeta, error) {
 	return res.Secrets, nil
 }
 
-func resolveOrgSecretID(apiBase, keyPath, name string) (string, error) {
-	secrets, err := fetchOrgSecrets(apiBase, keyPath)
+// orgSecretNames lists the org's secrets with their names opened by the org key,
+// sorted by name.
+func orgSecretNames(apiBase, keyPath string, orgPriv ed25519.PrivateKey) ([]orgSecretName, error) {
+	rows, err := fetchOrgSecrets(apiBase, keyPath)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	for _, s := range secrets {
-		if s.Label == name {
-			return s.SecretID, nil
+	out := make([]orgSecretName, 0, len(rows))
+	for _, r := range rows {
+		m, err := openSecretName(r.Meta, orgPriv)
+		if err != nil {
+			return nil, fmt.Errorf("open the name of org secret %s: %w", r.SecretID, err)
 		}
+		out = append(out, orgSecretName{SecretID: r.SecretID, Bundle: r.Bundle, secretMeta: m})
 	}
-	return "", fmt.Errorf("no org secret named %q", name)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Label < out[j].Label })
+	return out, nil
 }
