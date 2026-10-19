@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end on nokemo2's TPM. Runs in ~/p3sig-ks-e2e; cleans up its key and server.
+# End-to-end on a machine with a TPM: works in a temp dir, removes its key file after.
 set -u
 D=$(cd "$(dirname "$0")" && pwd); cd "$(mktemp -d)"; cp "$D/keyserver-client.php" client.php; cp "$(command -v p3sig || echo "$D/../p3sig")" p3sig
 export P3SIG_TPM_DIR=$PWD/tpm
