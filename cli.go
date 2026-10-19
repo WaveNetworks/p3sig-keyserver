@@ -595,12 +595,29 @@ func cmdSecretSet(f map[string]string, name string) error {
 		copies = append(copies, copyT{KeyID: k.KeyID, Enc: enc})
 	}
 	payload, _ := json.Marshal(copies)
-	// 4. upload ciphertext only
+	// 4. upload ciphertext only. A personal secret's name is sealed too, so the
+	// server holds no readable name for it; developer names stay readable
+	// (machines and .env files need them).
+	typ := firstNonEmpty(f["type"], "developer")
 	extra := url.Values{}
-	extra.Set("label", name)
-	extra.Set("type", firstNonEmpty(f["type"], "developer"))
-	if f["provider"] != "" {
-		extra.Set("provider", f["provider"])
+	extra.Set("type", typ)
+	if typ == "personal" {
+		meta, _ := json.Marshal(secretMeta{Label: name, Provider: f["provider"]})
+		names := make([]copyT, 0, len(mk.Keys))
+		for _, k := range mk.Keys {
+			enc, err := sealForKey(string(meta), k.Pub)
+			if err != nil {
+				return fmt.Errorf("seal name to key %s: %w", k.Label, err)
+			}
+			names = append(names, copyT{KeyID: k.KeyID, Enc: enc})
+		}
+		namePayload, _ := json.Marshal(names)
+		extra.Set("sealed_meta", string(namePayload))
+	} else {
+		extra.Set("label", name)
+		if f["provider"] != "" {
+			extra.Set("provider", f["provider"])
+		}
 	}
 	if f["bundle"] != "" {
 		extra.Set("bundle_id", f["bundle"])
@@ -629,6 +646,7 @@ func cmdSecretGetUser(f map[string]string, name string) error {
 		Secrets []struct {
 			Label string `json:"label"`
 			Enc   string `json:"encrypted_data"`
+			Meta  string `json:"encrypted_meta"`
 		} `json:"secrets"`
 	}
 	if err := userRequest(apiBase, "getMySecrets", keyPath, nil, &res); err != nil {
@@ -639,7 +657,16 @@ func cmdSecretGetUser(f map[string]string, name string) error {
 		return err
 	}
 	for _, s := range res.Secrets {
-		if s.Label == name {
+		label := s.Label
+		if label == "" && s.Meta != "" { // personal: the name is sealed too
+			if j, err := openSealedBox(s.Meta, key); err == nil {
+				var m secretMeta
+				if json.Unmarshal([]byte(j), &m) == nil {
+					label = m.Label
+				}
+			}
+		}
+		if label == name {
 			val, err := openSealedBox(s.Enc, key)
 			if err != nil {
 				return fmt.Errorf("unseal %q: %w", name, err)
@@ -649,6 +676,12 @@ func cmdSecretGetUser(f map[string]string, name string) error {
 		}
 	}
 	return fmt.Errorf("no secret named %q on this account", name)
+}
+
+// secretMeta is a personal secret's sealed name ({label, provider} JSON).
+type secretMeta struct {
+	Label    string `json:"label"`
+	Provider string `json:"provider"`
 }
 
 // readSecretValue reads a secret from stdin (piped) or prompts without echo.
