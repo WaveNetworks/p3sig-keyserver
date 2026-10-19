@@ -167,7 +167,7 @@ func TestKeyserverReplayAndRate(t *testing.T) {
 
 func TestKeyserverClientIPHeader(t *testing.T) {
 	f := newKSFixture(t)
-	f.srv.cfg.ClientIPHeader = "X-Forwarded-For"
+	f.srv.cfg().ClientIPHeader = "X-Forwarded-For"
 	req, _ := f.request(t, f.now.Unix())
 	body, _ := json.Marshal(req)
 

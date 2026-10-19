@@ -1,0 +1,45 @@
+[Unit]
+Description=p3sig key server (unlocks shared-hosting app bundles with this machine's TPM)
+Documentation=https://github.com/WaveNetworks/p3sig-keyserver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=p3sig-ks
+Group=p3sig-ks
+SupplementaryGroups=tss
+Environment=P3SIG_TPM_DIR=/var/lib/p3sig-keyserver/tpm
+ExecStart=/usr/local/bin/p3sig keyserver serve --config /etc/p3sig/keyserver.json --listen 127.0.0.1:8787
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Only the TPM resource manager, its own state dir and loopback networking.
+DevicePolicy=closed
+DeviceAllow=/dev/tpmrm0 rw
+ProtectSystem=strict
+ReadWritePaths=/var/lib/p3sig-keyserver
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
