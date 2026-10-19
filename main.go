@@ -157,6 +157,8 @@ func main() {
 		err = cmdSSHAgent(parseFlags(os.Args[2:]))
 	case "version", "-v", "--version":
 		fmt.Println("p3sig", version)
+	case "keyserver":
+		err = cmdKeyserver(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -604,6 +606,15 @@ CLIENT (your laptop)
                              Serve the chip key to ssh (biometric per connection).
 
   p3sig keygen [--out FILE]  Just generate a machine key + print its public half.
+
+KEY SERVER (shared-hosting fallback tier; needs a TPM)
+  p3sig keyserver init [--label N]
+                             Make the chip key; print the public point apps wrap to.
+  p3sig keyserver serve [--config FILE] [--listen ADDR]
+                             Unlock bundle keys for allowlisted apps
+                             (default ~/.p3sig/keyserver.json, 127.0.0.1:8787).
+  p3sig keyserver seal --pub B64 [--pub B64] --in values.json --out cache.enc
+                             Encrypt an app's values to one or more key servers.
 
 RECOVERY
   p3sig backup [--key FILE] [--out FILE] [--split M-of-N]
