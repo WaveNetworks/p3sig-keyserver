@@ -37,10 +37,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -153,7 +156,7 @@ func cmdKeyserverInit(f map[string]string) error {
 // ─── serve ──────────────────────────────────────────────────────────────────
 
 type keyServer struct {
-	cfg   *ksConfig
+	cfgP  atomic.Pointer[ksConfig] // swapped on SIGHUP
 	ks    Keystore
 	mu    sync.Mutex
 	seen  map[string]time.Time   // replay guard: sig hash -> expiry
@@ -184,6 +187,19 @@ func cmdKeyserverServe(f map[string]string) error {
 		addr = ksDefaultAddr
 	}
 	s := newKeyServer(cfg, ks)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			next, err := loadKSConfig(path)
+			if err != nil || next.Label != cfg.Label {
+				log.Printf("keyserver: reload REFUSED, keeping the old config: %v (label changes need a restart)", err)
+				continue
+			}
+			s.cfgP.Store(next)
+			log.Printf("keyserver: reloaded, %d app(s)", len(next.Apps))
+		}
+	}()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/unwrap", s.handleUnwrap)
 	mux.HandleFunc("/", http.NotFound)
@@ -201,11 +217,12 @@ func cmdKeyserverServe(f map[string]string) error {
 
 func newKeyServer(cfg *ksConfig, ks Keystore) *keyServer {
 	s := &keyServer{
-		cfg: cfg, ks: ks,
+		ks:   ks,
 		seen: map[string]time.Time{},
 		rate: map[string][]time.Time{},
 		now:  time.Now,
 	}
+	s.cfgP.Store(cfg)
 	if ks != nil {
 		s.agree = ks.Agree
 	}
@@ -225,12 +242,14 @@ func ksSigMessage(app string, ts int64, wrap []byte, reply string) []byte {
 	return []byte(ksSigContext + "|" + app + "|" + strconv.FormatInt(ts, 10) + "|" + hex.EncodeToString(h[:]) + "|" + reply)
 }
 
+func (s *keyServer) cfg() *ksConfig { return s.cfgP.Load() }
+
 func (s *keyServer) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	if h := s.cfg.ClientIPHeader; h != "" {
+	if h := s.cfg().ClientIPHeader; h != "" {
 		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 			if v := strings.TrimSpace(strings.Split(r.Header.Get(h), ",")[0]); v != "" {
 				return v
@@ -285,7 +304,7 @@ func (e ksRefusal) Error() string { return e.why }
 
 // unwrap runs every check before touching the chip, cheapest first.
 func (s *keyServer) unwrap(req ksRequest, ip string) ([]byte, error) {
-	app, ok := s.cfg.Apps[req.App]
+	app, ok := s.cfg().Apps[req.App]
 	if !ok {
 		return nil, ksRefusal{http.StatusForbidden, "unknown app"}
 	}
@@ -314,7 +333,7 @@ func (s *keyServer) unwrap(req ksRequest, ip string) ([]byte, error) {
 	}
 
 	s.chip.Lock()
-	bundleKey, err := UnwrapECDH(wrap, func(eph []byte) ([]byte, error) { return s.agree(s.cfg.Label, eph) })
+	bundleKey, err := UnwrapECDH(wrap, func(eph []byte) ([]byte, error) { return s.agree(s.cfg().Label, eph) })
 	s.chip.Unlock()
 	if err != nil {
 		return nil, ksRefusal{http.StatusForbidden, "wrap does not open with this key server's chip: " + err.Error()}
