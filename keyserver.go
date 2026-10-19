@@ -14,13 +14,20 @@ package main
 //	p3sig keyserver init   [--label keyserver]
 //	p3sig keyserver serve  [--config ~/.p3sig/keyserver.json] [--listen 127.0.0.1:8787]
 //	p3sig keyserver seal   --pub <b64 SEC1> [--pub ...] --in values.json --out cache.enc
+//	p3sig keyserver stats  [--config FILE] [--days 14]
 //
 // Request (POST /v1/unwrap, JSON):
 //
-//	{"app","ts","wrap","reply","sig"}  sig = Ed25519 over
+//	{"app","ts","wrap","reply","sig","why"}  sig = Ed25519 over
 //	"p3sig-ks-v1|<app>|<ts>|<hex sha256(wrap bytes)>|<reply b64>"
 //
 // Response: {"sealed": b64 crypto_box_seal(bundle key, reply)}.
+//
+// "why" (optional, unsigned, telemetry only) is the app's reason for asking: "cold" (its
+// memory copy was gone: a reboot or a first start — the real dependency on this server),
+// "refresh" (routine, after refresh_after), "retry"; with "-cli" when a CLI/cron process
+// asked. Every request for a known app is appended to events_file; `keyserver stats`
+// counts them per app and day.
 
 import (
 	"crypto/ecdh"
@@ -39,6 +46,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,8 +76,11 @@ type ksConfig struct {
 	// ClientIPHeader names the header the local proxy (Tailscale Funnel,
 	// Cloudflare Tunnel) puts the real client address in. Trusted only when the
 	// connection itself comes from loopback.
-	ClientIPHeader string           `json:"client_ip_header"`
-	Apps           map[string]ksApp `json:"apps"`
+	ClientIPHeader string `json:"client_ip_header"`
+	// EventsFile, when set, gets one JSON line per request for a known app (unlocked or
+	// refused). Requests naming no app (scanners) only go to the journal.
+	EventsFile string           `json:"events_file"`
+	Apps       map[string]ksApp `json:"apps"`
 }
 
 type ksApp struct {
@@ -114,7 +126,7 @@ func loadKSConfig(path string) (*ksConfig, error) {
 
 func cmdKeyserver(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("keyserver needs a subcommand: init | serve | seal")
+		return fmt.Errorf("keyserver needs a subcommand: init | serve | seal | stats")
 	}
 	f := parseFlags(args[1:])
 	switch args[0] {
@@ -124,6 +136,8 @@ func cmdKeyserver(args []string) error {
 		return cmdKeyserverServe(f)
 	case "seal":
 		return cmdKeyserverSeal(args[1:])
+	case "stats":
+		return cmdKeyserverStats(f)
 	}
 	return fmt.Errorf("unknown keyserver subcommand %q", args[0])
 }
@@ -162,6 +176,7 @@ type keyServer struct {
 	seen  map[string]time.Time   // replay guard: sig hash -> expiry
 	rate  map[string][]time.Time // app -> recent request times
 	chip  sync.Mutex             // one TPM command at a time
+	evMu  sync.Mutex             // serialises appends to events_file
 	now   func() time.Time
 	agree func(label string, peer []byte) ([]byte, error)
 }
@@ -235,6 +250,7 @@ type ksRequest struct {
 	Wrap  string `json:"wrap"`
 	Reply string `json:"reply"`
 	Sig   string `json:"sig"`
+	Why   string `json:"why"`
 }
 
 func ksSigMessage(app string, ts int64, wrap []byte, reply string) []byte {
@@ -261,8 +277,12 @@ func (s *keyServer) clientIP(r *http.Request) string {
 
 func (s *keyServer) handleUnwrap(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
+	var req ksRequest
 	refuse := func(code int, app, why string) {
 		log.Printf("keyserver: REFUSED app=%q ip=%s: %s", app, ip, why)
+		if _, known := s.cfg().Apps[app]; known {
+			s.record(ksEvent{App: app, IP: ip, OK: false, Why: ksWhy(req.Why), Err: why})
+		}
 		http.Error(w, http.StatusText(code), code)
 	}
 	if r.Method != http.MethodPost {
@@ -274,7 +294,6 @@ func (s *keyServer) handleUnwrap(w http.ResponseWriter, r *http.Request) {
 		refuse(http.StatusRequestEntityTooLarge, "", "body too large or unreadable")
 		return
 	}
-	var req ksRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		refuse(http.StatusBadRequest, "", "bad json")
 		return
@@ -290,9 +309,151 @@ func (s *keyServer) handleUnwrap(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("keyserver: unlocked app=%q ip=%s", req.App, ip)
+	log.Printf("keyserver: unlocked app=%q ip=%s why=%s", req.App, ip, ksWhy(req.Why))
+	s.record(ksEvent{App: req.App, IP: ip, OK: true, Why: ksWhy(req.Why)})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"sealed": base64.StdEncoding.EncodeToString(sealed)})
+}
+
+// ─── events: how often apps need this server ────────────────────────────────
+
+type ksEvent struct {
+	T   int64  `json:"t"`
+	App string `json:"app"`
+	IP  string `json:"ip"`
+	OK  bool   `json:"ok"`
+	Why string `json:"why,omitempty"`
+	Err string `json:"err,omitempty"`
+}
+
+var ksWhyOK = regexp.MustCompile(`^[a-z][a-z-]{0,15}$`)
+
+func ksWhy(w string) string {
+	if ksWhyOK.MatchString(w) {
+		return w
+	}
+	return "unknown"
+}
+
+func (s *keyServer) record(e ksEvent) {
+	path := s.cfg().EventsFile
+	if path == "" {
+		return
+	}
+	e.T = s.now().Unix()
+	line, _ := json.Marshal(e)
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		log.Printf("keyserver: cannot record event: %v", err)
+		return
+	}
+	f.Write(append(line, '\n'))
+	f.Close()
+}
+
+// stats: per app and UTC day — unlocks by reason, refusals — plus the last cold start.
+func cmdKeyserverStats(f map[string]string) error {
+	path, err := ksConfigPath(f)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadKSConfig(path)
+	if err != nil {
+		return err
+	}
+	if cfg.EventsFile == "" {
+		return fmt.Errorf("%s has no events_file; nothing is being recorded", path)
+	}
+	days := 14
+	if d, err := strconv.Atoi(f["days"]); err == nil && d > 0 {
+		days = d
+	}
+	b, err := os.ReadFile(cfg.EventsFile)
+	if err != nil {
+		return err
+	}
+	return ksPrintStats(os.Stdout, b, time.Now().UTC(), days)
+}
+
+func ksPrintStats(w io.Writer, b []byte, now time.Time, days int) error {
+	type row struct{ cold, refresh, other, refused int }
+	since := now.AddDate(0, 0, -days+1).Truncate(24 * time.Hour)
+	per := map[string]map[string]*row{} // app -> day -> counts
+	lastCold := map[string]time.Time{}
+	refusedWhy := map[string]map[string]int{}
+	for _, ln := range strings.Split(string(b), "\n") {
+		var e ksEvent
+		if ln == "" || json.Unmarshal([]byte(ln), &e) != nil {
+			continue
+		}
+		t := time.Unix(e.T, 0).UTC()
+		if strings.HasPrefix(e.Why, "cold") && e.OK && t.After(lastCold[e.App]) {
+			lastCold[e.App] = t
+		}
+		if t.Before(since) {
+			continue
+		}
+		day := t.Format("2006-01-02")
+		if per[e.App] == nil {
+			per[e.App] = map[string]*row{}
+		}
+		r := per[e.App][day]
+		if r == nil {
+			r = &row{}
+			per[e.App][day] = r
+		}
+		switch {
+		case !e.OK:
+			r.refused++
+			if refusedWhy[e.App] == nil {
+				refusedWhy[e.App] = map[string]int{}
+			}
+			refusedWhy[e.App][e.Err]++
+		case strings.HasPrefix(e.Why, "cold"):
+			r.cold++
+		case strings.HasPrefix(e.Why, "refresh"):
+			r.refresh++
+		default:
+			r.other++
+		}
+	}
+	if len(per) == 0 {
+		fmt.Fprintf(w, "no requests in the last %d day(s)\n", days)
+		return nil
+	}
+	apps := make([]string, 0, len(per))
+	for a := range per {
+		apps = append(apps, a)
+	}
+	sort.Strings(apps)
+	for _, a := range apps {
+		fmt.Fprintf(w, "%s  (last cold start: %s)\n", a, ksWhen(lastCold[a]))
+		fmt.Fprintf(w, "  %-10s %5s %8s %6s %8s\n", "day (UTC)", "cold", "refresh", "other", "refused")
+		dayKeys := make([]string, 0, len(per[a]))
+		for d := range per[a] {
+			dayKeys = append(dayKeys, d)
+		}
+		sort.Strings(dayKeys)
+		for _, d := range dayKeys {
+			r := per[a][d]
+			fmt.Fprintf(w, "  %-10s %5d %8d %6d %8d\n", d, r.cold, r.refresh, r.other, r.refused)
+		}
+		for why, n := range refusedWhy[a] {
+			fmt.Fprintf(w, "  refused %dx: %s\n", n, why)
+		}
+	}
+	fmt.Fprintln(w, "cold = the app had lost its memory copy (reboot, first start): it could not run without this server.")
+	fmt.Fprintln(w, "refresh = routine hourly re-check. other = older clients that don't say why.")
+	return nil
+}
+
+func ksWhen(t time.Time) string {
+	if t.IsZero() {
+		return "none recorded"
+	}
+	return t.Format("2006-01-02 15:04 UTC")
 }
 
 type ksRefusal struct {

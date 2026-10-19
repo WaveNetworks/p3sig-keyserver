@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -191,5 +192,49 @@ func TestKeyserverClientIPHeader(t *testing.T) {
 	f.srv.handleUnwrap(w, r)
 	if w.Code != 403 || !strings.Contains(w.Body.String(), "Forbidden") {
 		t.Fatalf("spoofed header from outside: %d", w.Code)
+	}
+}
+
+func TestKeyserverEventsAndStats(t *testing.T) {
+	f := newKSFixture(t)
+	f.srv.cfg().EventsFile = t.TempDir() + "/events.jsonl"
+
+	req, _ := f.request(t, f.now.Unix())
+	req.Why = "cold"
+	f.post(t, req, "203.0.113.7")
+	req2, _ := f.request(t, f.now.Unix())
+	req2.Why = "refresh"
+	f.post(t, req2, "203.0.113.7")
+	req3, _ := f.request(t, f.now.Unix()) // no "why": an older client
+	f.post(t, req3, "203.0.113.7")
+	bad, _ := f.request(t, f.now.Unix())
+	bad.Why = "cold"
+	f.post(t, bad, "198.51.100.1") // wrong address: refused, still recorded
+	junk := ksRequest{App: ""}
+	f.post(t, junk, "198.51.100.2") // no app: journal only
+
+	b, err := os.ReadFile(f.srv.cfg().EventsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(b), "\n"); n != 4 {
+		t.Fatalf("recorded %d events, want 4 (the no-app request is not recorded):\n%s", n, b)
+	}
+	if strings.Contains(string(b), req.Wrap) || strings.Contains(string(b), req.Sig) {
+		t.Fatal("events must not carry the wrap or signature")
+	}
+	var out bytes.Buffer
+	if err := ksPrintStats(&out, b, f.now.UTC(), 14); err != nil {
+		t.Fatal(err)
+	}
+	day := f.now.UTC().Format("2006-01-02")
+	for _, want := range []string{
+		"pilot  (last cold start: " + f.now.UTC().Format("2006-01-02 15:04 UTC") + ")",
+		day + "     1        1      1        1",
+		"refused 1x: address not allowed",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("stats missing %q:\n%s", want, out.String())
+		}
 	}
 }
