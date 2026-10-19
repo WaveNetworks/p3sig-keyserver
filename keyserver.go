@@ -371,6 +371,10 @@ func cmdKeyserverStats(f map[string]string) error {
 		days = d
 	}
 	b, err := os.ReadFile(cfg.EventsFile)
+	if os.IsNotExist(err) {
+		fmt.Println("no requests recorded yet")
+		return nil
+	}
 	if err != nil {
 		return err
 	}
