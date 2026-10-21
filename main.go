@@ -139,7 +139,7 @@ func main() {
 			err = cmdOrgGrant(parseFlags(rest))
 		case "secret":
 			if len(os.Args) < 4 {
-				err = fmt.Errorf("usage: p3sig org secret set|get|list [NAME]")
+				err = fmt.Errorf("usage: p3sig org secret set|get|list [NAME] | reseal --with DEVICE")
 				break
 			}
 			srest := os.Args[4:]
@@ -150,8 +150,10 @@ func main() {
 				err = cmdOrgSecretGet(parseFlags(srest), firstPositional(srest))
 			case "list":
 				err = cmdOrgSecretList(parseFlags(srest))
+			case "reseal":
+				err = cmdOrgSecretReseal(parseFlags(srest))
 			default:
-				err = fmt.Errorf("unknown org secret subcommand %q (set | get | list)", os.Args[3])
+				err = fmt.Errorf("unknown org secret subcommand %q (set | get | list | reseal)", os.Args[3])
 			}
 		case "rotate":
 			err = cmdOrgRotate(parseFlags(rest))
@@ -709,6 +711,10 @@ ORG VAULT (enterprise — shared, zero-knowledge; signs with your vault key)
   p3sig org secret set NAME        Store an org secret (value + name sealed to the org key).
   p3sig org secret get NAME        Fetch + open an org secret you have access to.
   p3sig org secret list            List org secret names (opened locally with the org key).
+  p3sig org secret reseal --with agent[:SHA256:…]|KEYFILE
+                                   Re-seal the org bundle copies on YOUR machines signed by a
+                                   delegated device (machines another member registered are
+                                   skipped: their agents trust that member's root, not yours).
   p3sig org rotate                 New org key: re-seal every secret, re-wrap to members.
 
 SSH (certificate authority)

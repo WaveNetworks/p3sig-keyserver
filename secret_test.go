@@ -168,3 +168,72 @@ func TestSecretResealSigns(t *testing.T) {
 		}
 	}
 }
+
+// `p3sig org secret reseal` (task #2598): each org bundle copy on a machine you
+// registered becomes a signed envelope the agent verifies; another member's
+// machine is skipped; an undelegated device uploads nothing.
+func TestOrgSecretResealSigns(t *testing.T) {
+	f := newPolicyFixture(t)
+	oPub, oPriv, _ := ed25519.GenerateKey(rand.Reader)
+	mPub, mPriv, _ := ed25519.GenerateKey(rand.Reader)
+	xPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	b64 := base64.StdEncoding.EncodeToString
+	org, err := sealSecretFor("s3cret", secretMeta{Label: "API_TOKEN"}, "KO", b64(oPub))
+	if err != nil {
+		t.Fatal(err)
+	}
+	type save struct {
+		machine string
+		copies  []resealCopy
+	}
+	var saved []save
+	fake := func(action string, extra url.Values, v any) error {
+		var body string
+		switch action {
+		case "getPolicyStatus":
+			body = `{"account":"7","delegations":[{"device_fp":"` + ssh.FingerprintSHA256(f.chip.PublicKey()) + `"}],"machines":[{"machine_id":"m1"}]}`
+		case "listOrgSecrets":
+			body = `{"secrets":[{"secret_id":"o1","bundle_id":"b1","bundle":"prod"},{"secret_id":"o2","bundle_id":""}]}`
+		case "getBundleMachines":
+			w, _ := json.Marshal(map[string]any{"machines": []any{
+				map[string]any{"machine_id": "m1", "keys": []any{map[string]string{"key_id": "KM1", "public_key": b64(mPub)}}},
+				map[string]any{"machine_id": "m2", "keys": []any{map[string]string{"key_id": "KX", "public_key": b64(xPub)}}},
+			}})
+			body = string(w)
+		case "getOrgBundleSecrets":
+			if extra.Get("bundle_id") != "b1" {
+				t.Errorf("bundle %q", extra.Get("bundle_id"))
+			}
+			w, _ := json.Marshal(map[string]any{"secrets": []any{map[string]string{"secret_id": "o1", "encrypted_data": org.Enc, "encrypted_meta": org.Meta}}})
+			body = string(w)
+		case "saveSealedForMachine":
+			var c []resealCopy
+			if err := json.Unmarshal([]byte(extra.Get("sealed_copies")), &c); err != nil {
+				return err
+			}
+			saved = append(saved, save{extra.Get("machine_id"), c})
+			return nil
+		default:
+			t.Fatalf("unexpected action %s", action)
+		}
+		return json.Unmarshal([]byte(body), v)
+	}
+
+	if _, err := orgSecretReseal(fake, oPriv, f.dongle, f.now); err == nil || saved != nil {
+		t.Fatalf("undelegated device allowed to reseal (%v, %d uploads)", err, len(saved))
+	}
+	r, err := orgSecretReseal(fake, oPriv, f.chip, f.now)
+	if err != nil || r.Signed != 1 || r.Machines != 1 || r.Skipped != 1 || len(saved) != 1 || saved[0].machine != "m1" {
+		t.Fatalf("org reseal: %+v uploads=%d err=%v", r, len(saved), err)
+	}
+	trust, err := newSecretTrust(f.signed(t, f.chip, 1, f.caKey), f.rootFP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := saved[0].copies[0]
+	name, _ := openSecretName(c.Meta, mPriv)
+	p, _ := openSealedBox(c.Enc, mPriv)
+	if v, err := openSecretValue(p, c.SecretID, name.Label, machineKeyFP(mPub), trust, f.now); err != nil || v != "s3cret" || name.Label != "API_TOKEN" {
+		t.Errorf("org machine copy does not verify: %q %q %v", v, name.Label, err)
+	}
+}

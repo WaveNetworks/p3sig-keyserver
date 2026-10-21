@@ -280,15 +280,8 @@ func secretReseal(call policyCall, vaultKey ed25519.PrivateKey, dev ssh.Signer, 
 	if err := call("getPolicyStatus", nil, &st); err != nil {
 		return 0, 0, err
 	}
-	devFP := ssh.FingerprintSHA256(dev.PublicKey())
-	live := false
-	for _, d := range st.Delegations {
-		if d.DeviceFP == devFP && !d.Revoked && (d.Expires == 0 || now.Unix() < d.Expires) {
-			live = true
-		}
-	}
-	if !live {
-		return 0, 0, fmt.Errorf("device %s has no live delegation on account %s — run `p3sig policy delegate` first, or agents will reject what it signs", devFP, st.Account)
+	if err := requireLiveDelegation(st, dev, now); err != nil {
+		return 0, 0, err
 	}
 	var own struct {
 		Keys []struct {
@@ -371,4 +364,188 @@ func secretReseal(call policyCall, vaultKey ed25519.PrivateKey, dev ssh.Signer, 
 		return 0, 0, err
 	}
 	return signed, plain, nil
+}
+
+// requireLiveDelegation refuses a device the account's root has not (or no longer)
+// delegated: agents would reject everything it signs.
+func requireLiveDelegation(st policyStatus, dev ssh.Signer, now time.Time) error {
+	devFP := ssh.FingerprintSHA256(dev.PublicKey())
+	for _, d := range st.Delegations {
+		if d.DeviceFP == devFP && !d.Revoked && (d.Expires == 0 || now.Unix() < d.Expires) {
+			return nil
+		}
+	}
+	return fmt.Errorf("device %s has no live delegation on account %s — run `p3sig policy delegate` first, or agents will reject what it signs", devFP, st.Account)
+}
+
+// ─── p3sig org secret reseal — sign-then-seal org bundle copies on machines ──
+// An org machine gets a granted bundle as copies an admin re-sealed from the org
+// key (browser: unsigned). This opens each bundle secret with the org key and
+// replaces every machine copy with an envelope signed by the delegated device.
+// Only machines whose signed policy comes from YOUR root can verify your device,
+// so machines another member registered are skipped (they keep their copies).
+
+type orgResealResult struct {
+	Signed, Machines, Skipped int
+}
+
+func cmdOrgSecretReseal(f map[string]string) error {
+	apiBase, keyPath, err := resolveIdentity(f)
+	if err != nil {
+		return err
+	}
+	dev, err := loadSigner(firstNonEmpty(f["with"], "agent"))
+	if err != nil {
+		return fmt.Errorf("--with (delegated device: agent[:SHA256:…] or a key file): %w", err)
+	}
+	key, err := loadKey(keyPath)
+	if err != nil {
+		return err
+	}
+	orgPriv, err := myOrgKey(apiBase, keyPath, key)
+	if err != nil {
+		return err
+	}
+	defer zero(orgPriv)
+	call := func(action string, extra url.Values, v any) error {
+		return userRequest(apiBase, action, keyPath, extra, v)
+	}
+	r, err := orgSecretReseal(call, orgPriv, dev, time.Now())
+	if err != nil {
+		return err
+	}
+	if r.Signed == 0 && r.Skipped == 0 {
+		fmt.Println("nothing to re-seal: no machine is granted an org bundle.")
+		return nil
+	}
+	fmt.Printf("re-sealed %d org secret cop(ies) on %d machine(s), signed by %s.\n", r.Signed, r.Machines, ssh.FingerprintSHA256(dev.PublicKey()))
+	if r.Skipped > 0 {
+		fmt.Printf("skipped %d machine(s) another member registered: their policy root is not yours, so they could not verify this device. That member can run this command for them.\n", r.Skipped)
+	}
+	return nil
+}
+
+// orgSecretReseal is the testable core: call in, counts out.
+func orgSecretReseal(call policyCall, orgPriv ed25519.PrivateKey, dev ssh.Signer, now time.Time) (orgResealResult, error) {
+	var r orgResealResult
+	var st policyStatus
+	if err := call("getPolicyStatus", nil, &st); err != nil {
+		return r, err
+	}
+	if err := requireLiveDelegation(st, dev, now); err != nil {
+		return r, err
+	}
+	mine := map[string]bool{}
+	for _, m := range st.Machines {
+		mine[m.MachineID] = true
+	}
+	var list struct {
+		Secrets []orgSecretRow `json:"secrets"`
+	}
+	if err := call("listOrgSecrets", nil, &list); err != nil {
+		return r, err
+	}
+	var bundles []string
+	seen := map[string]bool{}
+	for _, s := range list.Secrets {
+		if s.BundleID != "" && !seen[s.BundleID] {
+			seen[s.BundleID] = true
+			bundles = append(bundles, s.BundleID)
+		}
+	}
+	type opened struct {
+		id, value string
+		meta      secretMeta
+	}
+	skipped := map[string]bool{}
+	signedOn := map[string]bool{}
+	for _, b := range bundles {
+		q := url.Values{}
+		q.Set("bundle_id", b)
+		var bm struct {
+			Machines []struct {
+				MachineID string `json:"machine_id"`
+				Keys      []struct {
+					KeyID     string `json:"key_id"`
+					PublicKey string `json:"public_key"`
+				} `json:"keys"`
+			} `json:"machines"`
+		}
+		if err := call("getBundleMachines", q, &bm); err != nil {
+			return r, err
+		}
+		if len(bm.Machines) == 0 {
+			continue
+		}
+		var bs struct {
+			Secrets []struct {
+				SecretID string `json:"secret_id"`
+				Enc      string `json:"encrypted_data"`
+				Meta     string `json:"encrypted_meta"`
+			} `json:"secrets"`
+		}
+		if err := call("getOrgBundleSecrets", q, &bs); err != nil {
+			return r, err
+		}
+		var secrets []opened
+		for _, s := range bs.Secrets {
+			m, err := openSecretName(s.Meta, orgPriv)
+			if err != nil {
+				return r, fmt.Errorf("org secret %s: open name: %w", s.SecretID, err)
+			}
+			v, err := openOrgSecret(s.Enc, orgPriv)
+			if err != nil {
+				return r, fmt.Errorf("org secret %s: open value: %w", s.SecretID, err)
+			}
+			if strings.HasPrefix(v, signedSecretPrefix) {
+				return r, fmt.Errorf("org secret %s: the org copy holds a signed envelope, refusing to nest it", s.SecretID)
+			}
+			secrets = append(secrets, opened{s.SecretID, v, m})
+		}
+		if len(secrets) == 0 {
+			continue
+		}
+		for _, m := range bm.Machines {
+			if !mine[m.MachineID] {
+				skipped[m.MachineID] = true
+				continue
+			}
+			var out []resealCopy
+			for _, k := range m.Keys {
+				raw, err := base64.StdEncoding.DecodeString(k.PublicKey)
+				if err != nil || len(raw) != ed25519.PublicKeySize {
+					return r, fmt.Errorf("machine %s: key %s is malformed", m.MachineID, k.KeyID)
+				}
+				fp := machineKeyFP(ed25519.PublicKey(raw))
+				for _, s := range secrets {
+					enc, err := sealSignedSecret(dev, SignedSecret{Account: st.Account, SecretID: s.id, Name: s.meta.Label,
+						Value: s.value, Recipient: fp, Issued: now.Unix()}, k.PublicKey)
+					if err != nil {
+						return r, err
+					}
+					mj, _ := json.Marshal(s.meta)
+					meta, err := sealForKey(string(mj), k.PublicKey)
+					if err != nil {
+						return r, err
+					}
+					out = append(out, resealCopy{SecretID: s.id, sealedCopy: sealedCopy{KeyID: k.KeyID, Enc: enc, Meta: meta}})
+				}
+			}
+			if len(out) == 0 {
+				continue
+			}
+			payload, _ := json.Marshal(out)
+			save := url.Values{}
+			save.Set("machine_id", m.MachineID)
+			save.Set("bundle_id", b)
+			save.Set("sealed_copies", string(payload))
+			if err := call("saveSealedForMachine", save, nil); err != nil {
+				return r, fmt.Errorf("machine %s, bundle %s: %w", m.MachineID, b, err)
+			}
+			r.Signed += len(out)
+			signedOn[m.MachineID] = true
+		}
+	}
+	r.Machines, r.Skipped = len(signedOn), len(skipped)
+	return r, nil
 }

@@ -394,6 +394,7 @@ type orgKeyRef struct {
 // orgSecretRow is one row from listOrgSecrets: the name is sealed to the org key.
 type orgSecretRow struct {
 	SecretID string `json:"secret_id"`
+	BundleID string `json:"bundle_id"`
 	Bundle   string `json:"bundle"`
 	Meta     string `json:"encrypted_meta"`
 }
