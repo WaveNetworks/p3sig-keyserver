@@ -198,15 +198,65 @@ func cmdAgentPull(f map[string]string) error {
 	if err != nil {
 		return err
 	}
-	return agentPull(apiBase, machine, key, outDir)
+	root, req := signedFlags(f)
+	return agentPullWith(apiBase, machine, key, outDir, root, req)
 }
 
 func agentPull(apiBase, machine string, key ed25519.PrivateKey, outDir string) error {
+	return agentPullWith(apiBase, machine, key, outDir, os.Getenv("P3SIG_ROOT"), os.Getenv("P3SIG_REQUIRE_SIGNED") == "1")
+}
+
+// signedFlags: --root SHA256:… pins the root (saved after the first verified
+// pull); --require-signed refuses unsigned policy even before that.
+func signedFlags(f map[string]string) (string, bool) {
+	return firstNonEmpty(f["root"], os.Getenv("P3SIG_ROOT")),
+		f["require-signed"] == "true" || os.Getenv("P3SIG_REQUIRE_SIGNED") == "1"
+}
+
+// agentPullWith pulls the sshd trust files. With a pinned root it uses the
+// signed policy (task #2568) and never writes anything that fails verification;
+// once one signed policy has been applied, signatures are mandatory for good.
+func agentPullWith(apiBase, machine string, key ed25519.PrivateKey, outDir, rootFP string, requireSigned bool) error {
 	if err := os.MkdirAll(filepath.Join(outDir, "principals"), 0o755); err != nil {
 		return err
 	}
+	st := loadPolicyState(outDir)
+	if rootFP == "" {
+		rootFP = st.RootFP
+	} else if st.RootFP != "" && st.RootFP != rootFP {
+		return fmt.Errorf("root %s differs from the pinned root %s — refusing (re-init deliberately to change roots)", rootFP, st.RootFP)
+	}
+	mandatory := requireSigned || st.Version > 0
 
-	// 1. TrustedUserCAKeys
+	if rootFP != "" {
+		var sp SignedPolicy
+		err := pullInto(apiBase, "getSignedPolicy", machine, key, nil, &sp)
+		if err == nil && sp.Policy.Payload != "" {
+			p, verr := verifySignedPolicy(&sp, rootFP, st, time.Now())
+			if verr != nil {
+				return fmt.Errorf("signed policy REJECTED, old config kept: %w", verr)
+			}
+			if err := writeSSHFiles(outDir, strings.Join(p.CAKeys, "\n"), p.Grants, p.KRLSpec); err != nil {
+				return err
+			}
+			if err := savePolicyState(outDir, nextState(&sp, rootFP, p, st)); err != nil {
+				return err
+			}
+			fmt.Printf("pulled signed policy v%d: %d CA(s), %d principal grant(s) → %s\n", p.Version, len(p.CAKeys), len(p.Grants), outDir)
+			return nil
+		}
+		if mandatory {
+			if err == nil {
+				err = fmt.Errorf("server returned no signed policy")
+			}
+			return fmt.Errorf("signed policy required, old config kept: %w", err)
+		}
+	} else if mandatory {
+		return fmt.Errorf("signed policy required but no root pinned (--root SHA256:… / P3SIG_ROOT)")
+	}
+	fmt.Fprintln(os.Stderr, "WARNING: p3sig served an UNSIGNED policy; only TLS protects these sshd files. Pin a root (P3SIG_ROOT=SHA256:…) to require signatures.")
+
+	// Legacy unsigned path.
 	var ca struct {
 		Keys  string `json:"trusted_user_ca_keys"`
 		Count int    `json:"count"`
@@ -214,22 +264,42 @@ func agentPull(apiBase, machine string, key ed25519.PrivateKey, outDir string) e
 	if err := pullInto(apiBase, "getTrustedCA", machine, key, nil, &ca); err != nil {
 		return fmt.Errorf("getTrustedCA: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(outDir, "trusted_user_ca_keys"), []byte(ca.Keys+"\n"), 0o644); err != nil {
-		return err
-	}
-
-	// 2. AuthorizedPrincipalsFile — one file per login user
 	var pr struct {
-		Grants []struct {
-			Principal string `json:"principal"`
-			LoginUser string `json:"login_user"`
-		} `json:"grants"`
+		Grants []PolicyGrant `json:"grants"`
 	}
 	if err := pullInto(apiBase, "getPrincipals", machine, key, nil, &pr); err != nil {
 		return fmt.Errorf("getPrincipals: %w", err)
 	}
+	var krl struct {
+		Spec  string `json:"krl_spec"`
+		Count int    `json:"count"`
+	}
+	if err := pullInto(apiBase, "getKRL", machine, key, nil, &krl); err != nil {
+		return fmt.Errorf("getKRL: %w", err)
+	}
+	if err := writeSSHFiles(outDir, ca.Keys, pr.Grants, krl.Spec); err != nil {
+		return err
+	}
+	fmt.Printf("pulled: %d CA(s), %d principal grant(s), %d revocation(s) → %s\n",
+		ca.Count, len(pr.Grants), krl.Count, outDir)
+	return nil
+}
+
+// writeSSHFiles materializes TrustedUserCAKeys, one AuthorizedPrincipalsFile per
+// login user, and the compiled KRL. The KRL compiles first, so a bad spec
+// changes nothing; each file is replaced atomically.
+func writeSSHFiles(outDir, caKeys string, grants []PolicyGrant, krlSpec string) error {
+	specPath := filepath.Join(outDir, ".krl.spec")
+	if err := os.WriteFile(specPath, []byte(krlSpec+"\n"), 0o600); err != nil {
+		return err
+	}
+	krlPath := filepath.Join(outDir, "revoked_keys")
+	if out, err := exec.Command("ssh-keygen", "-kq", "-f", krlPath+".tmp", specPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("compile KRL (ssh-keygen): %v: %s", err, out)
+	}
+
 	byUser := map[string]map[string]bool{}
-	for _, g := range pr.Grants {
+	for _, g := range grants {
 		if byUser[g.LoginUser] == nil {
 			byUser[g.LoginUser] = map[string]bool{}
 		}
@@ -245,31 +315,14 @@ func agentPull(apiBase, machine string, key ed25519.PrivateKey, outDir string) e
 		}
 		sort.Strings(names)
 		path := filepath.Join(outDir, "principals", user)
-		if err := os.WriteFile(path, []byte(strings.Join(names, "\n")+"\n"), 0o644); err != nil {
+		if err := writeFileAtomic(path, []byte(strings.Join(names, "\n")+"\n"), 0o644); err != nil {
 			return err
 		}
 	}
-
-	// 3. RevokedKeys (KRL) — compile the spec with ssh-keygen
-	var krl struct {
-		Spec  string `json:"krl_spec"`
-		Count int    `json:"count"`
-	}
-	if err := pullInto(apiBase, "getKRL", machine, key, nil, &krl); err != nil {
-		return fmt.Errorf("getKRL: %w", err)
-	}
-	specPath := filepath.Join(outDir, ".krl.spec")
-	if err := os.WriteFile(specPath, []byte(krl.Spec+"\n"), 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(outDir, "trusted_user_ca_keys"), []byte(caKeys+"\n"), 0o644); err != nil {
 		return err
 	}
-	krlPath := filepath.Join(outDir, "revoked_keys")
-	if out, err := exec.Command("ssh-keygen", "-kq", "-f", krlPath, specPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("compile KRL (ssh-keygen): %v: %s", err, out)
-	}
-
-	fmt.Printf("pulled: %d CA(s), %d principal grant(s), %d revocation(s) → %s\n",
-		ca.Count, len(pr.Grants), krl.Count, outDir)
-	return nil
+	return os.Rename(krlPath+".tmp", krlPath)
 }
 
 func cmdAgentRun(f map[string]string) error {
@@ -283,9 +336,10 @@ func cmdAgentRun(f map[string]string) error {
 			interval = n
 		}
 	}
+	root, req := signedFlags(f)
 	fmt.Printf("p3sig agent: refreshing %s every %ds\n", outDir, interval)
 	for {
-		if err := agentPull(apiBase, machine, key, outDir); err != nil {
+		if err := agentPullWith(apiBase, machine, key, outDir, root, req); err != nil {
 			fmt.Fprintln(os.Stderr, "pull failed:", err)
 		}
 		time.Sleep(time.Duration(interval) * time.Second)
@@ -596,6 +650,9 @@ ORG VAULT (enterprise — shared, zero-knowledge; signs with your vault key)
 SSH (certificate authority)
   p3sig agent pull           Write TrustedUserCAKeys, AuthorizedPrincipalsFile/<user>, RevokedKeys.
   p3sig agent run [--interval SEC]   Same, looping (default 300s).
+      --root SHA256:…        pin the policy root; from then on only signed policy that chains to it
+                             is written, older versions are refused (also P3SIG_ROOT)
+      --require-signed       refuse unsigned policy even before the first signed pull
   p3sig agent install        Print the sshd_config lines to add.
 
 CLIENT (your laptop)
