@@ -35,7 +35,11 @@ import (
 	"filippo.io/edwards25519"
 )
 
-const httpTimeout = 20 * time.Second
+const httpTimeout = 45 * time.Second
+
+// gatewayRetryDelay is the pause before the one retry of a 502/503/504.
+var gatewayRetryDelay = 5 * time.Second
+
 const userAgent = "p3sig-agent/0.2"
 
 // Fallbacks when a value isn't given by flag, env (P3SIG_*), or a saved profile.
@@ -493,19 +497,35 @@ func postForm(apiBase string, form url.Values, v any) error {
 	// default "Go-http-client/1.1" with a 403 before the request reaches the app.
 	req.Header.Set("User-Agent", userAgent)
 
+	// The shared host answers short bursts with a gateway error before the
+	// request reaches PHP; retry those once after a pause. Timeouts are not
+	// retried — the first attempt may have landed.
 	client := &http.Client{Timeout: httpTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
+	var body []byte
+	var status int
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			time.Sleep(gatewayRetryDelay)
+			req.Body = io.NopCloser(strings.NewReader(form.Encode()))
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		body, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		status = resp.StatusCode
+		if attempt == 0 && (status == 502 || status == 503 || status == 504) {
+			continue
+		}
+		break
 	}
 	var ar apiResponse
 	if err := json.Unmarshal(body, &ar); err != nil {
-		return fmt.Errorf("invalid JSON (HTTP %d): %.200s", resp.StatusCode, body)
+		return fmt.Errorf("invalid JSON (HTTP %d): %.200s", status, body)
 	}
 	if ar.Error != "" {
 		return fmt.Errorf("%s", ar.Error)

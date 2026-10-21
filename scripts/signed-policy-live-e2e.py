@@ -175,7 +175,16 @@ def find_signed(o):
 
 
 def tamper(raw):
-    data = json.loads(raw)
+    # The attacker's replay/strip answers never depend on what upstream said
+    # (a throttled host returns an HTML page, which must not crash the proxy).
+    if MODE["m"] == "replay":
+        return json.dumps(MODE["replay"]).encode()
+    if MODE["m"] == "unsigned":
+        return json.dumps({"signed": False}).encode()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
     sp = find_signed(data)
     if sp is None:
         return raw
@@ -218,11 +227,14 @@ def handle(c):
         up.request(req[0], req[1], body=body, headers=fwd)
         resp = up.getresponse()
         out = resp.read()
+        status, reason = resp.status, resp.reason
         if body and b"getSignedPolicy" in body and MODE["m"] != "pass":
             out = tamper(out)
+            if MODE["m"] in ("replay", "unsigned"):
+                status, reason = 200, "OK"
         elif body and b"getSignedPolicy" in body:
             tamper(out)                             # record what the real server served
-        t.sendall(f"HTTP/1.1 {resp.status} {resp.reason}\r\nContent-Type: application/json\r\n"
+        t.sendall(f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n"
                   f"Content-Length: {len(out)}\r\nConnection: close\r\n\r\n".encode() + out)
         t.close()
     except Exception as e:
