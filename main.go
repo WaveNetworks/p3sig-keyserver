@@ -20,6 +20,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -381,7 +382,7 @@ func cmdSecretsPull(f map[string]string) error {
 	if err != nil {
 		return err
 	}
-	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"])
+	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], firstNonEmpty(f["root"], os.Getenv("P3SIG_ROOT")))
 	if err != nil {
 		return err
 	}
@@ -413,7 +414,7 @@ func cmdExec(args []string) error {
 	if err != nil {
 		return err
 	}
-	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"])
+	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], firstNonEmpty(f["root"], os.Getenv("P3SIG_ROOT")))
 	if err != nil {
 		return err
 	}
@@ -430,7 +431,7 @@ func cmdExec(args []string) error {
 	return c.Run()
 }
 
-func fetchSecrets(apiBase, machine string, key ed25519.PrivateKey, bundle string) ([][2]string, error) {
+func fetchSecrets(apiBase, machine string, key ed25519.PrivateKey, bundle, rootFP string) ([][2]string, error) {
 	extra := url.Values{}
 	if bundle != "" {
 		extra.Set("bundle", bundle)
@@ -445,19 +446,34 @@ func fetchSecrets(apiBase, machine string, key ed25519.PrivateKey, bundle string
 	if err := pullInto(apiBase, "getSealedSecrets", machine, key, extra, &res); err != nil {
 		return nil, err
 	}
+	// Sign-then-seal (task #2598): with a pinned root, a signed value must verify
+	// against the device chain before it is used.
+	trust, err := loadSecretTrust(apiBase, machine, key, rootFP)
+	if err != nil {
+		return nil, fmt.Errorf("secret signing chain: %w", err)
+	}
+	me := machineKeyFP(key.Public().(ed25519.PublicKey))
 	// The variable name is sealed next to the value; open both with this machine's key.
 	out := make([][2]string, 0, len(res.Secrets))
+	unsigned := 0
 	for _, s := range res.Secrets {
 		name, err := openSecretName(s.Meta, key)
 		if err != nil {
 			return nil, fmt.Errorf("open the name of secret %s: %w", s.SecretID, err)
 		}
-		val, err := openSealedBox(s.Encrypted, key)
+		plain, err := openSealedBox(s.Encrypted, key)
 		if err != nil {
 			return nil, fmt.Errorf("unseal %s: %w", name.Label, err)
 		}
+		val, err := openSecretValue(plain, s.SecretID, name.Label, me, trust, time.Now())
+		if errors.Is(err, errUnsignedSecret) {
+			unsigned++
+		} else if err != nil {
+			return nil, fmt.Errorf("secret %s REJECTED: %w", name.Label, err)
+		}
 		out = append(out, [2]string{name.Label, val})
 	}
+	warnUnsignedSecrets(unsigned, trust != nil)
 	sort.SliceStable(out, func(i, j int) bool { return out[i][0] < out[j][0] })
 	return out, nil
 }
