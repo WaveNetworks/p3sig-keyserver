@@ -84,6 +84,17 @@ func TestSignedSecretBundles(t *testing.T) {
 		t.Errorf("legacy value: %q %v", v, err)
 	}
 
+	// --require-signed: a legacy plain value is refused; a signed one still opens.
+	if v, u, err := acceptSecretValue("plain-old", "s1", "DB_PASS", me, trustFor(), f.now, false); err != nil || !u || v != "plain-old" {
+		t.Errorf("legacy value without --require-signed: %q %v %v", v, u, err)
+	}
+	if v, _, err := acceptSecretValue("plain-old", "s1", "DB_PASS", me, trustFor(), f.now, true); err == nil || v != "" {
+		t.Errorf("legacy value accepted with --require-signed: %q", v)
+	}
+	if v, u, err := acceptSecretValue(plain, "s1", "DB_PASS", me, trustFor(), f.now, true); err != nil || u || v != "hunter2" {
+		t.Errorf("signed value with --require-signed: %q %v %v", v, u, err)
+	}
+
 	// A wrong pinned root refuses the whole chain.
 	if _, err := newSecretTrust(f.signed(t, f.chip, 1, f.caKey), "SHA256:wrong"); err == nil {
 		t.Error("wrong root accepted")

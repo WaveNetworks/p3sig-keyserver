@@ -135,7 +135,8 @@ func cmdSecretsList(f map[string]string) error {
 	if err != nil {
 		return err
 	}
-	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], firstNonEmpty(f["root"], os.Getenv("P3SIG_ROOT")))
+	rootFP, requireSigned := signedFlags(f)
+	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], rootFP, requireSigned)
 	if err != nil {
 		return err
 	}
@@ -157,7 +158,8 @@ func cmdSecretsGet(f map[string]string, name string) error {
 	if err != nil {
 		return err
 	}
-	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], firstNonEmpty(f["root"], os.Getenv("P3SIG_ROOT")))
+	rootFP, requireSigned := signedFlags(f)
+	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], rootFP, requireSigned)
 	if err != nil {
 		return err
 	}

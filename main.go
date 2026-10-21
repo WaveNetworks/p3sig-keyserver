@@ -384,7 +384,8 @@ func cmdSecretsPull(f map[string]string) error {
 	if err != nil {
 		return err
 	}
-	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], firstNonEmpty(f["root"], os.Getenv("P3SIG_ROOT")))
+	rootFP, requireSigned := signedFlags(f)
+	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], rootFP, requireSigned)
 	if err != nil {
 		return err
 	}
@@ -416,7 +417,8 @@ func cmdExec(args []string) error {
 	if err != nil {
 		return err
 	}
-	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], firstNonEmpty(f["root"], os.Getenv("P3SIG_ROOT")))
+	rootFP, requireSigned := signedFlags(f)
+	pairs, err := fetchSecrets(apiBase, machine, key, f["bundle"], rootFP, requireSigned)
 	if err != nil {
 		return err
 	}
@@ -433,7 +435,10 @@ func cmdExec(args []string) error {
 	return c.Run()
 }
 
-func fetchSecrets(apiBase, machine string, key ed25519.PrivateKey, bundle, rootFP string) ([][2]string, error) {
+// requireSigned (--require-signed / P3SIG_REQUIRE_SIGNED=1, the same switch as
+// signed policy) refuses every unsigned value instead of warning: for agents whose
+// secrets have all been re-sealed signed, a plain value can only be a forgery.
+func fetchSecrets(apiBase, machine string, key ed25519.PrivateKey, bundle, rootFP string, requireSigned bool) ([][2]string, error) {
 	extra := url.Values{}
 	if bundle != "" {
 		extra.Set("bundle", bundle)
@@ -454,6 +459,9 @@ func fetchSecrets(apiBase, machine string, key ed25519.PrivateKey, bundle, rootF
 	if err != nil {
 		return nil, fmt.Errorf("secret signing chain: %w", err)
 	}
+	if requireSigned && trust == nil {
+		return nil, errors.New("signed secrets required but no root pinned (--root SHA256:… / P3SIG_ROOT)")
+	}
 	me := machineKeyFP(key.Public().(ed25519.PublicKey))
 	// The variable name is sealed next to the value; open both with this machine's key.
 	out := make([][2]string, 0, len(res.Secrets))
@@ -467,11 +475,12 @@ func fetchSecrets(apiBase, machine string, key ed25519.PrivateKey, bundle, rootF
 		if err != nil {
 			return nil, fmt.Errorf("unseal %s: %w", name.Label, err)
 		}
-		val, err := openSecretValue(plain, s.SecretID, name.Label, me, trust, time.Now())
-		if errors.Is(err, errUnsignedSecret) {
-			unsigned++
-		} else if err != nil {
+		val, isUnsigned, err := acceptSecretValue(plain, s.SecretID, name.Label, me, trust, time.Now(), requireSigned)
+		if err != nil {
 			return nil, fmt.Errorf("secret %s REJECTED: %w", name.Label, err)
+		}
+		if isUnsigned {
+			unsigned++
 		}
 		out = append(out, [2]string{name.Label, val})
 	}
@@ -672,6 +681,9 @@ SECRETS
   p3sig secrets list         List the secret names granted to this machine.
   p3sig secrets get NAME     Print one secret's value.
   p3sig secrets pull [--export]   Print KEY=VALUE (with --export: shell-quoted exports).
+      --root SHA256:…        verify signed secrets against this root (also P3SIG_ROOT)
+      --require-signed       refuse any unsigned secret (also P3SIG_REQUIRE_SIGNED=1);
+                             for secrets, run, exec, secrets get/list
   p3sig run -- CMD [args]    Run CMD with the granted secrets in its environment
                              (alias: p3sig exec).
 

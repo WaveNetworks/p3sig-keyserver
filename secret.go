@@ -14,7 +14,7 @@ package main
 // so a valid envelope can't be replayed under another secret or re-sealed to
 // another machine. The agent verifies it before any value reaches the process
 // environment. Plain (legacy) values still open, with a warning when a root is
-// pinned; making signatures mandatory for enrolled agents is a later flag.
+// pinned, or are refused outright with --require-signed / P3SIG_REQUIRE_SIGNED=1.
 
 import (
 	"crypto/ed25519"
@@ -174,6 +174,23 @@ func openSecretValue(plain, secretID, name, recipientFP string, trust *secretTru
 		return "", fmt.Errorf("signed for machine %s, not this one (%s)", s.Recipient, recipientFP)
 	}
 	return s.Value, nil
+}
+
+// acceptSecretValue applies openSecretValue plus the mandatory-signature switch:
+// with requireSigned an unsigned value is an error, otherwise it is returned and
+// flagged so the caller can count it for the warning.
+func acceptSecretValue(plain, secretID, name, recipientFP string, trust *secretTrust, now time.Time, requireSigned bool) (string, bool, error) {
+	val, err := openSecretValue(plain, secretID, name, recipientFP, trust, now)
+	if errors.Is(err, errUnsignedSecret) {
+		if requireSigned {
+			return "", false, errors.New("not signed and signatures are required (--require-signed / P3SIG_REQUIRE_SIGNED=1); re-seal it with `p3sig secret reseal --with agent`")
+		}
+		return val, true, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return val, false, nil
 }
 
 // loadSecretTrust fetches the signed policy chain when a root is pinned. No root →
