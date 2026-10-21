@@ -4,7 +4,7 @@
 #   (b) a tampered response (MITM with a CA the box trusts) injecting a CA is REJECTED, old CA kept
 #   (c) a replayed older signed policy is rejected
 #   (d) a revoked device's signature is rejected
-# Everything is throwaway: a fresh account (xxxx@nokemo.com), keys in a temp dir, a user-mode
+# Everything is throwaway: a fresh account (xxxx@contactsweep.com), keys in a temp dir, a user-mode
 # sshd on 127.0.0.1, and a local MITM proxy whose CA only this run's agent trusts (SSL_CERT_FILE).
 #   python3 scripts/signed-policy-live-e2e.py [--bin ./p3sig-agent] [--base https://p3sig.com/p3sig]
 # The device key is a software ed25519 key held in ssh-agent — the same path the dongle (ssh-add, sk)
@@ -50,20 +50,56 @@ web = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
 
 def post(path, **form):
-    r = web.open(BASE + path, urllib.parse.urlencode(form).encode())
-    return r.geturl(), r.read().decode("utf-8", "replace")
+    # The host throttles bursts (a fast run got a 502 on the 4th form post): space the posts
+    # out and retry a gateway error once, slowly — never a tight loop.
+    for attempt in (1, 2):
+        time.sleep(2)
+        try:
+            r = web.open(BASE + path, urllib.parse.urlencode(form).encode())
+            return r.geturl(), r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code not in (502, 503) or attempt == 2:
+                raise
+            print(f"note: HTTP {e.code} on {path}, retrying once in 30s", flush=True)
+            time.sleep(30)
 
 
-email = f"signedpolicy-{secrets.token_hex(4)}@nokemo.com"
+# @contactsweep.com is a catch-all into the nokemo@nokemo.com inbox, which himalaya (account
+# "nokemo") reads — so the live sign-up's confirmation mail can be followed like a real user would.
+email = f"signedpolicy-{secrets.token_hex(4)}@contactsweep.com"
 pw = "SignedPolicy-E2E-" + secrets.token_hex(6)
 post("/auth/register.php", action="register", email=email, password=pw, confirm_password=pw, agree_terms="1")
+
+
+def confirm_link(addr, wait=180):
+    """Find the 'Confirm Your Account' mail sent to addr and return its auth/confirm.php link."""
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        r = sh("himalaya", "envelope", "list", "--account", "nokemo", "--output", "json", ok=False)
+        try:
+            envs = json.loads(r.stdout or "[]")
+        except ValueError:
+            envs = []
+        for e in envs:
+            if ((e.get("to") or {}).get("addr") or "").lower() == addr.lower() and "confirm" in (e.get("subject") or "").lower():
+                body = sh("himalaya", "message", "read", str(e["id"]), "--account", "nokemo", ok=False).stdout
+                m = re.search(r"https://[^\s\"'<>]+/auth/confirm\.php\?hash=[A-Za-z0-9%._-]+", body)
+                if m:
+                    return m.group(0)
+        time.sleep(10)
+    return None
+
+
+link = confirm_link(email)
+check(bool(link), f"confirmation mail for {email} arrived")
+if not link:
+    raise SystemExit("no confirmation mail within 3 min — stopping")
+web.open(link).read()
 post("/auth/login.php", action="login", email=email, password=pw)
 _, body = post("/app/index.php?page=vault-setup", noop="1")
-check("logout" in body.lower(), f"registered + logged in on {HOST} as {email}")
+check("logout" in body.lower(), f"confirmed + logged in on {HOST} as {email}")
 if fails:
-    # Live sign-up sends a confirmation email first ("Please confirm your email address before
-    # logging in"); this run has no reader for the @nokemo.com mailbox yet.
-    raise SystemExit("cannot sign in to the fresh account (email confirmation required) — stopping")
+    raise SystemExit("cannot sign in to the fresh account — stopping")
 
 def keygen(name):
     out = sh(BIN, "keygen", "--out", p(name)).stdout
@@ -80,6 +116,14 @@ for k in ("ca1", "evil", "root", "device", "user"):
     sh("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", k, "-f", p(k))
 ca1 = open(p("ca1.pub")).read().strip()
 post("/app/index.php?page=ssh-access", action="registerSshCa", name="e2e-ca1", public_key=ca1)
+# A CA reaches a machine only through a principal grant (p3sig_policy_draft joins on grants).
+me = getpass.getuser()
+_, page = post("/app/index.php?page=ssh-access", noop="1")
+cm = re.search(r'<option value="([^"]+)">e2e-ca1</option>', page)
+check(bool(cm), "CA registered")
+CAID = cm.group(1) if cm else ""
+post("/app/index.php?page=ssh-access", action="grantSshPrincipal", ca_id=CAID, machine_id=MID,
+     principal=me, login_user=me)
 
 env = dict(os.environ, P3SIG_URL=API, P3SIG_VAULT_KEY=p("vault.key"), P3SIG_CONFIG=p("cfg.json"))
 st = sh(BIN, "policy", "status", env=env, ok=False)
@@ -213,12 +257,12 @@ def ca_file():
 
 # ── (a) v1 through the proxy untouched → lands on a real sshd ─────────────────
 r = pull()
-check(r.returncode == 0 and "signed policy v1" in r.stdout, f"(a) agent applied signed v1 [{(r.stdout + r.stderr).strip()[:160]}]")
+check(r.returncode == 0 and "pulled signed policy v" in r.stdout and "1 CA(s)" in r.stdout, f"(a) agent applied signed v1 [{(r.stdout + r.stderr).strip()[:160]}]")
 check(ca1.split()[1] in ca_file(), "(a) CA1 written to trusted_user_ca_keys")
 v1 = MODE["seen"][-1] if MODE["seen"] else None
+V1 = json.loads(open(os.path.join(OUT, ".p3sig-policy-state.json")).read()).get("version") if r.returncode == 0 else None
 
 sh("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", p("hostkey"))
-me = getpass.getuser()
 sh("ssh-keygen", "-q", "-s", p("ca1"), "-I", "e2e", "-n", me, "-V", "+10m", p("user.pub"))
 port = 22000 + secrets.randbelow(2000)
 open(p("sshd_config"), "w").write(
@@ -254,7 +298,13 @@ MODE["m"] = "pass"
 # ── (c) sign v2, apply it, then replay v1 ────────────────────────────────────
 s2 = sign()
 r = pull()
-check(s2.returncode == 0 and r.returncode == 0 and "signed policy v2" in r.stdout, "(c) device-signed v2 applied")
+def applied_version():
+    return json.loads(open(os.path.join(OUT, ".p3sig-policy-state.json")).read()).get("version")
+
+
+V2 = applied_version() if r.returncode == 0 else None
+check(s2.returncode == 0 and r.returncode == 0 and V1 is not None and V2 is not None and V2 > V1,
+      f"(c) device-signed v2 applied (v{V2} > v{V1})")
 MODE["m"], MODE["replay"] = "replay", v1
 r = pull()
 check(v1 is not None and r.returncode != 0 and "REJECTED" in r.stderr + r.stdout, f"(c) replayed v1 rejected [{(r.stderr + r.stdout).strip()[:160]}]")
@@ -269,7 +319,7 @@ st_before = open(os.path.join(OUT, ".p3sig-policy-state.json")).read()
 r = pull()
 check(s3.returncode == 0 and rv.returncode == 0, "(d) v3 signed, then device revoked by the root")
 check(r.returncode != 0 and "REJECTED" in r.stderr + r.stdout, f"(d) revoked device's v3 rejected [{(r.stderr + r.stdout).strip()[:160]}]")
-check(json.loads(st_before).get("version") == 2 and ca_file() == before, "(d) box still on v2, CA file unchanged")
+check(json.loads(st_before).get("version") == V2 and applied_version() == V2 and ca_file() == before, "(d) box still on v2, CA file unchanged")
 check(ssh_as("ca1-cert.pub"), "(d) sshd still accepts the CA1 cert (old config kept)")
 s4 = sign()
 check(s4.returncode != 0, "(d) server refuses a new policy from the revoked device")
