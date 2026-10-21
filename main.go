@@ -110,7 +110,7 @@ func main() {
 		err = cmdLogin(parseFlags(os.Args[2:]))
 	case "secret":
 		if len(os.Args) < 3 {
-			err = fmt.Errorf("usage: p3sig secret set|get NAME  (manage your own secrets via your vault key)")
+			err = fmt.Errorf("usage: p3sig secret set|get NAME | reseal --with DEVICE  (manage your own secrets via your vault key)")
 			break
 		}
 		rest := os.Args[3:]
@@ -119,8 +119,10 @@ func main() {
 			err = cmdSecretSet(parseFlags(rest), firstPositional(rest))
 		case "get":
 			err = cmdSecretGetUser(parseFlags(rest), firstPositional(rest))
+		case "reseal":
+			err = cmdSecretReseal(parseFlags(rest))
 		default:
-			err = fmt.Errorf("unknown secret subcommand %q (set | get)", os.Args[2])
+			err = fmt.Errorf("unknown secret subcommand %q (set | get | reseal)", os.Args[2])
 		}
 	case "org":
 		if len(os.Args) < 3 {
@@ -680,8 +682,12 @@ MANAGE (your account — signs with your vault USB key)
                              Store a secret: value AND name sealed to your keys
                              CLIENT-SIDE, only ciphertext uploaded. Value via stdin or
                              prompt (never argv). Machines granted the bundle get it when
-                             you re-seal in the browser (Seal now).
+                             you re-seal (browser "Seal now", or below — signed).
   p3sig secret get NAME      Fetch + unseal one of your secrets locally.
+  p3sig secret reseal --with agent[:SHA256:…]|KEYFILE
+                             Re-seal every machine copy of your secrets SIGNED by a
+                             delegated device (sign-then-seal), so agents with a pinned
+                             root can tell you sealed them, not the server.
 
 ORG VAULT (enterprise — shared, zero-knowledge; signs with your vault key)
   p3sig org create --name NAME     Create an organization + its vault (client-side keypair).

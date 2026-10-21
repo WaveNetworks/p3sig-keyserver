@@ -18,10 +18,12 @@ package main
 
 import (
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -199,4 +201,157 @@ func warnUnsignedSecrets(n int, rootPinned bool) {
 		hint = "Re-seal them signed with a delegated device key."
 	}
 	fmt.Fprintf(os.Stderr, "WARNING: %d secret(s) are not signed; only encryption protects them, not who sealed them. %s\n", n, hint)
+}
+
+// ─── p3sig secret reseal — sign-then-seal every machine copy ─────────────────
+// The browser can open and re-seal but can't sign (no device key), so machine
+// copies it makes are unsigned. `p3sig secret reseal --with DEVICE` asks for
+// every machine copy of the account's own secrets (getResealWork resign=1),
+// opens one of the account's copies with the vault key, and replaces each
+// machine copy with an envelope signed by the delegated device. Own vault keys
+// missing a copy get a plain one (signatures are for machines).
+
+type resealWork struct {
+	SecretID string `json:"secret_id"`
+	Missing  []struct {
+		KeyID     string `json:"key_id"`
+		PublicKey string `json:"public_key"`
+	} `json:"missing"`
+	Copies map[string]struct {
+		Enc  string `json:"encrypted_data"`
+		Meta string `json:"encrypted_meta"`
+	} `json:"copies"`
+}
+
+type resealCopy struct {
+	SecretID string `json:"secret_id"`
+	sealedCopy
+}
+
+func cmdSecretReseal(f map[string]string) error {
+	apiBase, keyPath, err := resolveIdentity(f)
+	if err != nil {
+		return err
+	}
+	dev, err := loadSigner(firstNonEmpty(f["with"], "agent"))
+	if err != nil {
+		return fmt.Errorf("--with (delegated device: agent[:SHA256:…] or a key file): %w", err)
+	}
+	key, err := loadKey(keyPath)
+	if err != nil {
+		return err
+	}
+	call := func(action string, extra url.Values, v any) error {
+		return userRequest(apiBase, action, keyPath, extra, v)
+	}
+	signed, plain, err := secretReseal(call, key, dev, time.Now())
+	if err != nil {
+		return err
+	}
+	if signed+plain == 0 {
+		fmt.Println("nothing to re-seal: no machine is granted any of your secrets.")
+		return nil
+	}
+	fmt.Printf("re-sealed %d machine cop(ies) signed by %s, %d vault-key cop(ies) plain.\n"+
+		"Agents with a pinned root verify them on their next pull.\n", signed, ssh.FingerprintSHA256(dev.PublicKey()), plain)
+	return nil
+}
+
+// secretReseal is the testable core: call in, counts out.
+func secretReseal(call policyCall, vaultKey ed25519.PrivateKey, dev ssh.Signer, now time.Time) (signed, plain int, err error) {
+	var st policyStatus
+	if err := call("getPolicyStatus", nil, &st); err != nil {
+		return 0, 0, err
+	}
+	devFP := ssh.FingerprintSHA256(dev.PublicKey())
+	live := false
+	for _, d := range st.Delegations {
+		if d.DeviceFP == devFP && !d.Revoked && (d.Expires == 0 || now.Unix() < d.Expires) {
+			live = true
+		}
+	}
+	if !live {
+		return 0, 0, fmt.Errorf("device %s has no live delegation on account %s — run `p3sig policy delegate` first, or agents will reject what it signs", devFP, st.Account)
+	}
+	var own struct {
+		Keys []struct {
+			KeyID string `json:"key_id"`
+		} `json:"keys"`
+	}
+	if err := call("getMyVaultKeys", nil, &own); err != nil {
+		return 0, 0, err
+	}
+	ownKey := map[string]bool{}
+	for _, k := range own.Keys {
+		ownKey[k.KeyID] = true
+	}
+	var res struct {
+		Work []resealWork `json:"work"`
+	}
+	extra := url.Values{}
+	extra.Set("resign", "1")
+	if err := call("getResealWork", extra, &res); err != nil {
+		return 0, 0, err
+	}
+	var out []resealCopy
+	for _, w := range res.Work {
+		var value string
+		var meta secretMeta
+		opened := false
+		for _, c := range w.Copies {
+			m, err := openSecretName(c.Meta, vaultKey)
+			if err != nil {
+				continue
+			}
+			if v, err := openSealedBox(c.Enc, vaultKey); err == nil {
+				value, meta, opened = v, m, true
+				break
+			}
+		}
+		if !opened {
+			fmt.Fprintf(os.Stderr, "skip %s: none of its copies opens with this vault key\n", w.SecretID)
+			continue
+		}
+		if strings.HasPrefix(value, signedSecretPrefix) {
+			return 0, 0, fmt.Errorf("secret %s: your own copy holds a signed envelope, refusing to nest it", w.SecretID)
+		}
+		mj, _ := json.Marshal(meta)
+		for _, r := range w.Missing {
+			var c sealedCopy
+			if ownKey[r.KeyID] {
+				if c, err = sealSecretFor(value, meta, r.KeyID, r.PublicKey); err != nil {
+					return 0, 0, err
+				}
+				plain++
+			} else {
+				raw, err := base64.StdEncoding.DecodeString(r.PublicKey)
+				if err != nil || len(raw) != ed25519.PublicKeySize {
+					return 0, 0, fmt.Errorf("secret %s: machine key %s is malformed", w.SecretID, r.KeyID)
+				}
+				s := SignedSecret{Account: st.Account, SecretID: w.SecretID, Name: meta.Label, Value: value,
+					Recipient: machineKeyFP(ed25519.PublicKey(raw)), Issued: now.Unix()}
+				enc, err := sealSignedSecret(dev, s, r.PublicKey)
+				if err != nil {
+					return 0, 0, err
+				}
+				m, err := sealForKey(string(mj), r.PublicKey)
+				if err != nil {
+					return 0, 0, err
+				}
+				c = sealedCopy{KeyID: r.KeyID, Enc: enc, Meta: m}
+				signed++
+			}
+			out = append(out, resealCopy{SecretID: w.SecretID, sealedCopy: c})
+		}
+	}
+	if len(out) == 0 {
+		return 0, 0, nil
+	}
+	payload, _ := json.Marshal(out)
+	save := url.Values{}
+	save.Set("sealed_copies", string(payload))
+	if err := call("saveResealed", save, nil); err != nil {
+		return 0, 0, err
+	}
+	return signed, plain, nil
 }
