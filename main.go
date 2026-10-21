@@ -170,6 +170,16 @@ func main() {
 			rest = os.Args[3:]
 		}
 		err = cmdPolicy(sub, parseFlags(rest))
+	case "vault":
+		sub := ""
+		if len(os.Args) > 2 {
+			sub = os.Args[2]
+		}
+		var rest []string
+		if len(os.Args) > 3 {
+			rest = os.Args[3:]
+		}
+		err = cmdVault(sub, parseFlags(rest))
 	case "setup":
 		err = cmdSetup(parseFlags(os.Args[2:]))
 	case "ssh-agent":
@@ -716,6 +726,12 @@ ORG VAULT (enterprise — shared, zero-knowledge; signs with your vault key)
                                    delegated device (machines another member registered are
                                    skipped: their agents trust that member's root, not yours).
   p3sig org rotate                 New org key: re-seal every secret, re-wrap to members.
+
+BROWSER VAULT
+  p3sig vault verify [--url API]   Check the browser vault the site serves right now against
+                                   the release p3sig's deploy signed (key pinned in this
+                                   binary). A FAIL means the server changed the vault code:
+                                   do not use the browser vault, use this CLI.
 
 SSH (certificate authority)
   p3sig agent pull           Write TrustedUserCAKeys, AuthorizedPrincipalsFile/<user>, RevokedKeys.
