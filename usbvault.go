@@ -303,9 +303,17 @@ func cloneTo(f map[string]string, in *bufio.Reader, key ed25519.PrivateKey) erro
 	return nil
 }
 
-// usbSigner is the `usb` / `usb:PATH` key source: finds the stick holding a
-// p3sig key and asks for its passphrase.
-func usbSigner(spec string) (ssh.Signer, error) {
+// usbKeyCache holds keys already unwrapped from a stick in this process, so a
+// command that signs several requests (secret reseal, vault setup) asks for the
+// passphrase once.
+var usbKeyCache = map[string]ed25519.PrivateKey{}
+
+// usbKey is the `usb` / `usb:PATH` key source: finds the stick holding a p3sig
+// key and asks for its passphrase.
+func usbKey(spec string) (ed25519.PrivateKey, error) {
+	if k, ok := usbKeyCache[spec]; ok {
+		return k, nil
+	}
 	f := map[string]string{"drive": strings.TrimPrefix(strings.TrimPrefix(spec, "usb"), ":")}
 	drive, err := pickUSB(f, bufio.NewReader(os.Stdin), true, "vault stick")
 	if err != nil {
@@ -313,6 +321,17 @@ func usbSigner(spec string) (ssh.Signer, error) {
 	}
 	p, _ := readPassphrase("Vault stick passphrase: ")
 	key, err := readUSBKey(drive, []byte(p))
+	if err != nil {
+		return nil, err
+	}
+	usbKeyCache[spec] = key
+	return key, nil
+}
+
+func isUSBSpec(spec string) bool { return spec == "usb" || strings.HasPrefix(spec, "usb:") }
+
+func usbSigner(spec string) (ssh.Signer, error) {
+	key, err := usbKey(spec)
 	if err != nil {
 		return nil, err
 	}

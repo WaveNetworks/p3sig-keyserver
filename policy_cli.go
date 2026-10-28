@@ -417,7 +417,7 @@ func loadSigner(spec string) (ssh.Signer, error) {
 	if spec == "" || spec == "true" {
 		return nil, errors.New("no key given")
 	}
-	if spec == "usb" || strings.HasPrefix(spec, "usb:") {
+	if isUSBSpec(spec) {
 		return usbSigner(spec)
 	}
 	if spec == "dongle" || strings.HasPrefix(spec, "dongle:") {

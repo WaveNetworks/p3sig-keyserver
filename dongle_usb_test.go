@@ -140,3 +140,26 @@ func TestUSBInterruptedAndUsedDrives(t *testing.T) {
 		t.Fatal("wrote to a used drive")
 	}
 }
+
+// loadKey (the keyPath commands: login, secret, vault) takes the usb:PATH source
+// and asks for the passphrase once per process.
+func TestLoadKeyUSBSource(t *testing.T) {
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	d := t.TempDir()
+	if err := storeOnUSB(d, key, []byte("stick pass"), fastArgon); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("P3SIG_PASSPHRASE", "stick pass")
+	got, err := loadKey("usb:" + d)
+	if err != nil || !got.Equal(key) {
+		t.Fatalf("loadKey usb: %v", err)
+	}
+	t.Setenv("P3SIG_PASSPHRASE", "wrong") // cached: no second unwrap
+	if again, err := loadKey("usb:" + d); err != nil || !again.Equal(key) {
+		t.Fatalf("cached usb key: %v", err)
+	}
+	delete(usbKeyCache, "usb:"+d)
+	if _, err := loadKey("usb:" + d); err == nil {
+		t.Fatal("wrong passphrase unwrapped")
+	}
+}

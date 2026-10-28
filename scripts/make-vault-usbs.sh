@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SUPERSEDED (task #2630): use `p3sig usb init` + `p3sig usb clone`.
 # make-vault-usbs.sh — turn two blank USB drives into the p3sig vault pair:
 # DAILY (carry) and SAFE (disaster recovery). Each gets a VeraCrypt container
 # (p3sig-vault.hc, same layout as the Windows E:\keys.hc) holding ONE fresh

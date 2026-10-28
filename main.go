@@ -634,6 +634,9 @@ func loadKey(path string) (ed25519.PrivateKey, error) {
 	if path == "" {
 		return nil, fmt.Errorf("--key is required")
 	}
+	if isUSBSpec(path) {
+		return usbKey(path)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -769,6 +772,7 @@ VAULT STICKS + DONGLE (setup in 3 commands; no VeraCrypt, no sudo, no ssh-agent)
   p3sig dongle add [--root-key usb]   PIN (set if none), resident ES256 ssh:p3sig-policy key
                              (PIN required), delegated with the root from the vault stick.
   Key sources: --root-key / --with take usb[:PATH] (finds the stick, asks the passphrase) and
+  so does --key / P3SIG_VAULT_KEY (login, secret, vault: asked once per command), and
   --with dongle[:SHA256:…] (this binary asks the PIN and the touch itself).
 
 SIGNED POLICY (what agents accept: root in the safe → delegated dongle/chip keys)
