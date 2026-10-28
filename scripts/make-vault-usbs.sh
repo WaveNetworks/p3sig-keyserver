@@ -50,6 +50,21 @@ prep() { # prep PARTITION LABEL → mounts the plain FAT at $WORK/fat-LABEL
   if [ -n "$(lsblk -no MOUNTPOINT "$p")" ]; then umount "$p"; fi
   mkdir -p "$WORK/fat-$label"
   mount -o "uid=$OWNER_UID,gid=$OWNER_GID,umask=077" "$p" "$WORK/fat-$label"
+  # A rerun after an interrupted run: DAILY keeps its container (it may hold the
+  # key); SAFE never got the key unless PUBLIC-KEY.txt exists, so its leftover
+  # container is empty and is made again.
+  if [ "$(ls -A "$WORK/fat-$label")" = p3sig-vault.hc ]; then
+    if [ "$label" = DAILY ]; then
+      echo "$p already has a vault container — it will be opened, not replaced."
+      read -r -p "Continue? type yes: " ok
+      [ "$ok" = yes ] || die "stopped"
+      return
+    fi
+    read -r -p "$p has an unfinished vault container (no key in it). Delete it and start this drive again? type yes: " ok
+    [ "$ok" = yes ] || die "stopped"
+    rm "$WORK/fat-$label/p3sig-vault.hc"
+    return
+  fi
   if [ -n "$(ls -A "$WORK/fat-$label")" ]; then
     ls -la "$WORK/fat-$label"
     die "$p is not empty — refusing to touch it"
@@ -64,13 +79,27 @@ prep() { # prep PARTITION LABEL → mounts the plain FAT at $WORK/fat-LABEL
 container() { # container LABEL → creates + mounts p3sig-vault.hc at $WORK/vc-LABEL
   local label=$1
   local hc="$WORK/fat-$label/p3sig-vault.hc"
-  echo; echo "== $label drive: choose its VeraCrypt passphrase (asked twice) =="
-  veracrypt -t -c --volume-type=normal --size="$SIZE" --encryption=AES --hash=SHA-512 \
-    --filesystem=FAT --pim=0 -k "" --random-source=/dev/urandom "$hc"
+  if [ ! -e "$hc" ]; then
+    echo; echo "== $label drive: choose its VeraCrypt passphrase (asked twice) =="
+    veracrypt -t -c --volume-type=normal --size="$SIZE" --encryption=AES --hash=SHA-512 \
+      --filesystem=FAT --pim=0 -k "" --random-source=/dev/urandom "$hc"
+  fi
   mkdir -p "$WORK/vc-$label"
-  echo "== $label drive: enter the passphrase again to open it =="
-  veracrypt -t --pim=0 -k "" --protect-hidden=no \
-    --fs-options="uid=$OWNER_UID,gid=$OWNER_GID,umask=077" "$hc" "$WORK/vc-$label"
+  # --hash and --pim pinned so a mistyped passphrase fails in seconds; VeraCrypt's
+  # own retry prompt asks for a PIM and tries every hash (minutes), so we loop.
+  # The passphrase goes in on stdin, never argv.
+  local try pw
+  for try in 1 2 3; do
+    read -rs -p "== $label drive: passphrase to open it (no PIM): " pw; echo
+    if printf '%s\n' "$pw" | veracrypt -t --non-interactive --stdin --hash=SHA-512 --pim=0 -k "" \
+         --protect-hidden=no --fs-options="uid=$OWNER_UID,gid=$OWNER_GID,umask=077" \
+         "$hc" "$WORK/vc-$label" >/dev/null 2>&1; then
+      pw=; return
+    fi
+    echo "That passphrase did not open the $label container."
+  done
+  pw=
+  die "could not open the $label container"
 }
 
 prep "$DAILY" DAILY
@@ -78,7 +107,14 @@ prep "$SAFE" SAFE
 
 container DAILY
 KEY="$WORK/vc-DAILY/p3sig-root.key"
-PUB=$("$P3SIG" keygen --out "$KEY" | tail -1)
+if [ -e "$KEY" ]; then
+  # Rerun: never replace an existing key. Public half = last 32 bytes of the
+  # 64-byte Ed25519 private key.
+  echo "DAILY already holds a key; keeping it."
+  PUB=$(base64 -d "$KEY" | tail -c 32 | base64 -w0)
+else
+  PUB=$("$P3SIG" keygen --out "$KEY" | tail -1)
+fi
 chown "$OWNER_UID:$OWNER_GID" "$KEY"
 
 container SAFE
