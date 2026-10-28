@@ -62,7 +62,8 @@ prep() { # prep PARTITION LABEL → mounts the plain FAT at $WORK/fat-LABEL
 }
 
 container() { # container LABEL → creates + mounts p3sig-vault.hc at $WORK/vc-LABEL
-  local label=$1 hc="$WORK/fat-$label/p3sig-vault.hc"
+  local label=$1
+  local hc="$WORK/fat-$label/p3sig-vault.hc"
   echo; echo "== $label drive: choose its VeraCrypt passphrase (asked twice) =="
   veracrypt -t -c --volume-type=normal --size="$SIZE" --encryption=AES --hash=SHA-512 \
     --filesystem=FAT --pim=0 -k "" --random-source=/dev/urandom "$hc"
