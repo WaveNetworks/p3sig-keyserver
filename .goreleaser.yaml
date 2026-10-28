@@ -1,7 +1,8 @@
 # GoReleaser config for p3sig — https://goreleaser.com
 #
-# Scope: this file builds + publishes the CGO-FREE targets (linux amd64/arm64,
-# windows amd64) and every package manager that consumes them. macOS is built,
+# Scope: this file builds + publishes the linux + windows targets (linux amd64
+# is a cgo build with the libfido2 dongle backend; linux arm64 + windows amd64
+# are cgo-free and have no `--with dongle`) and every package manager that consumes them. macOS is built,
 # signed and notarized SEPARATELY in .github/workflows/release.yml (it needs cgo
 # on a real Mac + a provisioning profile) and its signed .app zips are attached
 # to the same GitHub release via `release.extra_files`, then a Homebrew *cask*
@@ -39,10 +40,33 @@ builds:
       # ship only windows/amd64 (windows arm64 is unvalidated)
       - goos: windows
         goarch: arm64
+      # linux/amd64 comes from p3sig-linux-fido below
+      - goos: linux
+        goarch: amd64
+
+  # linux/amd64 with the libfido2 dongle backend (task #2630): `p3sig dongle add`
+  # and `--with dongle`. Links libfido2.so.1 at runtime (prototypes are declared
+  # in dongle_libfido2.go, so only the runtime lib is needed to build); the
+  # deb/rpm/AUR packages depend on it. CC=gcc so a `cc` shim on PATH is ignored.
+  - id: p3sig-linux-fido
+    binary: p3sig
+    main: .
+    env:
+      - CGO_ENABLED=1
+      - CC=gcc
+    flags:
+      - -trimpath
+      - -tags=libfido2
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - linux
+    goarch:
+      - amd64
 
 archives:
   - id: p3sig
-    ids: [p3sig]
+    ids: [p3sig, p3sig-linux-fido]
     name_template: "p3sig_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
     format_overrides:
@@ -71,7 +95,7 @@ changelog:
 # Linux native packages → apt (.deb) / dnf-yum (.rpm)
 nfpms:
   - id: p3sig
-    ids: [p3sig]
+    ids: [p3sig, p3sig-linux-fido]
     package_name: p3sig
     vendor: Wave Networks
     homepage: https://p3sig.com
@@ -84,6 +108,14 @@ nfpms:
     formats:
       - deb
       - rpm
+    # the amd64 binary links libfido2.so.1 (dongle backend); package names differ
+    overrides:
+      deb:
+        dependencies:
+          - libfido2-1
+      rpm:
+        dependencies:
+          - libfido2
     bindir: /usr/bin
     contents:
       - src: README.md
@@ -137,7 +169,7 @@ winget:
 # Arch Linux: AUR (-bin package, prebuilt binary)
 aurs:
   - name: p3sig-bin
-    ids: [p3sig]
+    ids: [p3sig, p3sig-linux-fido]
     homepage: https://p3sig.com
     description: "Zero-knowledge secrets vault client and SSH certificate authority agent."
     maintainers:
@@ -145,6 +177,8 @@ aurs:
     license: MIT
     private_key: "{{ .Env.AUR_KEY }}"
     git_url: "ssh://aur@aur.archlinux.org/p3sig-bin.git"
+    depends:
+      - libfido2
     provides:
       - p3sig
     conflicts:

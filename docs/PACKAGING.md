@@ -7,7 +7,7 @@ Pushing a semver tag (`git tag v0.4.0 && git push origin v0.4.0`) runs
    Developer ID + provisioning profile, **notarizes + staples**, and zips each
    `.app` → `p3sig-darwin-<arch>.zip`.
 2. **release job** (`ubuntu`): GoReleaser builds linux amd64/arm64 + windows
-   amd64 (cgo-free), creates the GitHub Release (attaching the macOS zips), and
+   amd64 (linux amd64 is a cgo `-tags libfido2` build linking libfido2.so.1, so `p3sig dongle add` / `--with dongle` work; its deb/rpm/AUR packages depend on libfido2-1 / libfido2 / libfido2; linux arm64 + windows are cgo-free with no dongle backend), creates the GitHub Release (attaching the macOS zips), and
    publishes to the package managers below. Then it renders the **Homebrew cask**
    and pushes it to the tap.
 

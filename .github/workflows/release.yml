@@ -91,6 +91,10 @@ jobs:
         with:
           go-version: stable
 
+      # linux/amd64 is a cgo build linking libfido2.so.1 (dongle backend, task #2630)
+      - name: Install libfido2 runtime for the cgo linux build
+        run: sudo apt-get update && sudo apt-get install -y gcc libfido2-1
+
       - name: Pull in notarized macOS artifacts
         uses: actions/download-artifact@v4
         with:
