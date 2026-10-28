@@ -19,7 +19,7 @@ open)
   PART=${2:-/dev/disk/by-label/P3SIG-DAILY}
   [ -b "$PART" ] || die "$PART not found — is the drive plugged in?"
   mountpoint -q "$VAULT" && die "a vault is already open at $VAULT (close it first)"
-  mkdir -p "$FAT" "$VAULT"; chmod 700 /run/p3sig
+  mkdir -p "$FAT" "$VAULT"; chown "$OWNER_UID:$OWNER_GID" /run/p3sig; chmod 700 /run/p3sig
   mountpoint -q "$FAT" || mount -o "uid=$OWNER_UID,gid=$OWNER_GID,umask=077" "$PART" "$FAT"
   [ -e "$FAT/p3sig-vault.hc" ] || { umount "$FAT"; die "$PART has no p3sig-vault.hc"; }
   for try in 1 2 3; do
