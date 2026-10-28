@@ -90,6 +90,10 @@ nfpms:
         dst: /usr/share/doc/p3sig/README.md
       - src: LICENSE
         dst: /usr/share/doc/p3sig/LICENSE
+      # FIDO2 dongles readable by plugdev (task #2630); on a box with no desktop
+      # login the uaccess ACL goes to gdm, so this is what lets `--with dongle` work.
+      - src: packaging/70-p3sig-fido.rules
+        dst: /usr/lib/udev/rules.d/70-p3sig-fido.rules
 
 # Windows: Scoop bucket (self-serve, no review)
 scoops:

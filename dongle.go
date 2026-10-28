@@ -78,7 +78,7 @@ var openDongles func() ([]Dongle, error)
 
 func findDongle() (Dongle, error) {
 	if openDongles == nil {
-		return nil, errors.New("this p3sig build has no FIDO2 support (build with CC=gcc go build -tags libfido2, needs libfido2-dev); use --with agent meanwhile")
+		return nil, errors.New("this p3sig build has no FIDO2 support (build with CC=gcc go build -tags libfido2, needs only the libfido2 runtime library); use --with agent meanwhile")
 	}
 	ds, err := openDongles()
 	if err != nil {
