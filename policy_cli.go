@@ -15,7 +15,11 @@ package main
 //
 // The server only stores what is signed here. Requests are authenticated with the
 // account's vault key (p3sig login), which need NOT be the root: the root stays in
-// the safe and is needed only for root/delegate/revoke.
+// the safe and is needed only for root/delegate/revoke. When no vault key is
+// readable (the vault USB is unplugged), `policy sign` and `policy status`
+// authenticate with the delegated device itself (task #2629): the server
+// re-checks its root-signed delegation and the revoked list on every request,
+// and accepts a device only for policy draft/upload/status.
 
 import (
 	"bufio"
@@ -64,11 +68,27 @@ func cmdPolicy(sub string, f map[string]string) error {
 		return errors.New("usage: p3sig policy root|delegate|revoke|sign|status  (run `p3sig help`)")
 	}
 	apiBase, keyPath, err := resolveIdentity(f)
-	if err != nil {
-		return err
+	if err == nil {
+		if _, serr := os.Stat(keyPath); serr != nil {
+			err = fmt.Errorf("vault key %s is not readable (vault USB unplugged?): %w", keyPath, serr)
+		}
 	}
 	call := func(action string, extra url.Values, v any) error {
 		return userRequest(apiBase, action, keyPath, extra, v)
+	}
+	if err != nil {
+		if sub != "sign" && sub != "status" {
+			return err
+		}
+		dev, derr := loadSigner(firstNonEmpty(f["with"], "agent"))
+		if derr != nil {
+			return fmt.Errorf("%v\nand no signing device to authenticate with (--with agent[:SHA256:…]|KEYFILE): %w", err, derr)
+		}
+		fmt.Fprintf(os.Stderr, "no vault key — authenticating as delegated device %s (a dongle asks for a touch per request)\n",
+			ssh.FingerprintSHA256(dev.PublicKey()))
+		call = func(action string, extra url.Values, v any) error {
+			return deviceRequest(apiBase, action, dev, f["account"], extra, v)
+		}
 	}
 	switch sub {
 	case "status":
@@ -328,6 +348,43 @@ func describePolicy(machine string, p Policy) string {
 	}
 	fmt.Fprintf(&sb, "  KRL: %d revoked entr(ies), must be re-signed by %s\n", krl, time.Unix(p.KRLExpires, 0).UTC().Format("2006-01-02 15:04Z"))
 	return sb.String()
+}
+
+// ─── device-authenticated requests (task #2629) ──────────────────────────────
+
+const deviceAuthCtx = "p3sig-device-auth-v1\n"
+
+// deviceAuthForm: the auth fields for a request signed by a delegated device —
+// a signature over "<ctx><action>|<fp>|<ts>" (server: p3sig_device_request_guard).
+// Binding the action means a captured auth for policy status cannot upload.
+func deviceAuthForm(dev ssh.Signer, action string, now time.Time) (url.Values, error) {
+	fp := ssh.FingerprintSHA256(dev.PublicKey())
+	ts := strconv.FormatInt(now.Unix(), 10)
+	sig, err := dev.Sign(nil, []byte(deviceAuthCtx+action+"|"+fp+"|"+ts))
+	if err != nil {
+		return nil, fmt.Errorf("device %s did not sign the request: %w", fp, err)
+	}
+	return url.Values{
+		"device_key": {authorizedKey(dev.PublicKey())},
+		"ts":         {ts},
+		"device_sig": {base64.StdEncoding.EncodeToString(ssh.Marshal(sig))},
+	}, nil
+}
+
+// deviceRequest is userRequest with the delegated device as the credential.
+func deviceRequest(apiBase, action string, dev ssh.Signer, account string, extra url.Values, v any) error {
+	form, err := deviceAuthForm(dev, action, time.Now())
+	if err != nil {
+		return err
+	}
+	for k, vals := range extra {
+		form[k] = vals
+	}
+	if account != "" {
+		form.Set("account", account)
+	}
+	form.Set("action", action)
+	return postForm(apiBase, form, v)
 }
 
 // ─── signers and device keys ─────────────────────────────────────────────────

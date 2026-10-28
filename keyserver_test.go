@@ -3,10 +3,15 @@ package main
 import (
 	"bytes"
 	"crypto/ecdh"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +21,7 @@ import (
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/nacl/box"
+	"golang.org/x/crypto/ssh"
 )
 
 // ksFixture: a key server whose "chip" is a software P-256 key, one app
@@ -235,6 +241,98 @@ func TestKeyserverEventsAndStats(t *testing.T) {
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("stats missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+// ─── delegated-device request auth (task #2629) ──────────────────────────────
+
+// fakeSK is a FIDO-style ssh.Signer built in software: it signs exactly what an
+// sk-ecdsa / sk-ed25519 authenticator signs (sha256(app)||flags||counter||sha256(msg),
+// OpenSSH PROTOCOL.u2f), so the server's verifier can be tested without a dongle.
+type fakeSK struct {
+	pub  ssh.PublicKey
+	app  string
+	sign func(data []byte) ([]byte, error)
+}
+
+func (k fakeSK) PublicKey() ssh.PublicKey { return k.pub }
+func (k fakeSK) Sign(_ io.Reader, msg []byte) (*ssh.Signature, error) {
+	rest := []byte{0x01, 0, 0, 0, 7} // user present, counter 7
+	ah, mh := sha256.Sum256([]byte(k.app)), sha256.Sum256(msg)
+	blob, err := k.sign(append(append(ah[:], rest...), mh[:]...))
+	if err != nil {
+		return nil, err
+	}
+	return &ssh.Signature{Format: k.pub.Type(), Blob: blob, Rest: rest}, nil
+}
+
+func newFakeSKECDSA(t *testing.T) ssh.Signer {
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	q := elliptic.Marshal(elliptic.P256(), k.X, k.Y)
+	pub, err := ssh.ParsePublicKey(ssh.Marshal(struct {
+		T, C string
+		Q    []byte
+		A    string
+	}{
+		"sk-ecdsa-sha2-nistp256@openssh.com", "nistp256", q, "ssh:"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fakeSK{pub, "ssh:", func(d []byte) ([]byte, error) {
+		h := sha256.Sum256(d)
+		r, s, err := ecdsa.Sign(rand.Reader, k, h[:])
+		if err != nil {
+			return nil, err
+		}
+		return ssh.Marshal(struct{ R, S *big.Int }{r, s}), nil
+	}}
+}
+
+func newFakeSKEd25519(t *testing.T) ssh.Signer {
+	p, k, _ := ed25519.GenerateKey(rand.Reader)
+	pub, err := ssh.ParsePublicKey(ssh.Marshal(struct {
+		T string
+		P []byte
+		A string
+	}{
+		"sk-ssh-ed25519@openssh.com", p, "ssh:"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fakeSK{pub, "ssh:", func(d []byte) ([]byte, error) { return ed25519.Sign(k, d), nil }}
+}
+
+func deviceSigners(t *testing.T) map[string]ssh.Signer {
+	_, ek, _ := ed25519.GenerateKey(rand.Reader)
+	ed, _ := ssh.NewSignerFromKey(ek)
+	pk, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	chip, _ := ssh.NewSignerFromKey(pk)
+	return map[string]ssh.Signer{"ed25519": ed, "p256": chip, "sk_ecdsa": newFakeSKECDSA(t), "sk_ed25519": newFakeSKEd25519(t)}
+}
+
+func TestDeviceAuthForm(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	for name, dev := range deviceSigners(t) {
+		form, err := deviceAuthForm(dev, "policyPutBlob", now)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(form.Get("device_key")))
+		if err != nil || ssh.FingerprintSHA256(pub) != ssh.FingerprintSHA256(dev.PublicKey()) {
+			t.Fatalf("%s: device_key does not round-trip: %v", name, err)
+		}
+		raw, _ := base64.StdEncoding.DecodeString(form.Get("device_sig"))
+		sig := new(ssh.Signature)
+		if err := ssh.Unmarshal(raw, sig); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		msg := deviceAuthCtx + "policyPutBlob|" + ssh.FingerprintSHA256(pub) + "|1800000000"
+		if form.Get("ts") != "1800000000" || pub.Verify([]byte(msg), sig) != nil {
+			t.Fatalf("%s: signature is not over %q", name, msg)
+		}
+		if pub.Verify([]byte(deviceAuthCtx+"getPolicyStatus|"+ssh.FingerprintSHA256(pub)+"|1800000000"), sig) == nil {
+			t.Fatalf("%s: auth for one action verifies for another", name)
 		}
 	}
 }

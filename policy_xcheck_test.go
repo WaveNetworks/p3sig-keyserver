@@ -75,3 +75,35 @@ func TestZZVerify(t *testing.T) {
 	_, err = verifySignedPolicy(&sp, "SHA256:not-the-root", policyState{}, time.Now())
 	t.Logf("wrong pinned root: %v", err)
 }
+
+// Device-auth fixture for tests/device_auth_test.php (task #2629): a root, four
+// delegated devices (ed25519, P-256 chip, sk-ecdsa, sk-ed25519) and a fresh auth
+// form per device and action.  P3SIG_XCHECK=1 go test -run TestZZEmitDeviceAuth
+func TestZZEmitDeviceAuth(t *testing.T) {
+	if os.Getenv("P3SIG_XCHECK") == "" {
+		t.Skip("set P3SIG_XCHECK=1")
+	}
+	os.MkdirAll("/tmp/p3pol", 0o755)
+	_, rk, _ := ed25519.GenerateKey(rand.Reader)
+	root, _ := ssh.NewSignerFromKey(rk)
+	now := time.Now()
+	out := map[string]any{"root_key": authorizedKey(root.PublicKey())}
+	devs := map[string]any{}
+	for name, dev := range deviceSigners(t) {
+		d, _ := signDelegation(root, Delegation{Account: "user:1", DeviceKey: authorizedKey(dev.PublicKey()), Label: name, Issued: now.Unix()})
+		auth := map[string]any{}
+		for _, a := range []string{"getPolicyStatus", "getPolicyDraft", "policyPutBlob", "getSecret"} {
+			f, err := deviceAuthForm(dev, a, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			auth[a] = map[string]string{"device_key": f.Get("device_key"), "ts": f.Get("ts"), "device_sig": f.Get("device_sig")}
+		}
+		devs[name] = map[string]any{"fp": ssh.FingerprintSHA256(dev.PublicKey()), "delegation": d, "auth": auth}
+	}
+	out["devices"] = devs
+	rv, _ := signRevocations(root, Revocations{Account: "user:1", Version: 3, Revoked: []string{devs["p256"].(map[string]any)["fp"].(string)}})
+	out["revs"] = rv
+	j, _ := json.Marshal(out)
+	os.WriteFile("/tmp/p3pol/devauth.json", j, 0o644)
+}

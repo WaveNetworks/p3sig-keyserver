@@ -475,7 +475,7 @@ func resolveIdentity(f map[string]string) (apiBase, keyPath string, err error) {
 	apiBase = firstNonEmpty(f["url"], os.Getenv("P3SIG_URL"), id.URL, defaultAPI)
 	keyPath = firstNonEmpty(f["key"], os.Getenv("P3SIG_VAULT_KEY"), id.Key)
 	if keyPath == "" {
-		return "", "", fmt.Errorf("no vault key — run `p3sig login --key <vault key file>`")
+		return apiBase, "", fmt.Errorf("no vault key — run `p3sig login --key <vault key file>`")
 	}
 	return apiBase, keyPath, nil
 }
