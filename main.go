@@ -180,6 +180,20 @@ func main() {
 			rest = os.Args[3:]
 		}
 		err = cmdVault(sub, parseFlags(rest))
+	case "usb", "dongle":
+		sub := ""
+		if len(os.Args) > 2 {
+			sub = os.Args[2]
+		}
+		var rest []string
+		if len(os.Args) > 3 {
+			rest = os.Args[3:]
+		}
+		if os.Args[1] == "usb" {
+			err = cmdUSB(sub, parseFlags(rest))
+		} else {
+			err = cmdDongle(sub, parseFlags(rest))
+		}
 	case "setup":
 		err = cmdSetup(parseFlags(os.Args[2:]))
 	case "ssh-agent":
@@ -743,6 +757,17 @@ SSH (certificate authority)
                              is written, older versions are refused (also P3SIG_ROOT)
       --require-signed       refuse unsigned policy even before the first signed pull
   p3sig agent install        Print the sshd_config lines to add.
+
+VAULT STICKS + DONGLE (setup in 3 commands; no VeraCrypt, no sudo, no ssh-agent)
+  p3sig usb init [--from KEYFILE] [--drive PATH]
+                             New vault/root key on a blank FAT stick (DAILY), passphrase-wrapped
+                             (Argon2id + AES-GCM), then cloned + verified onto SAFE. Resumes an
+                             interrupted run; never overwrites a key. --from migrates an old key.
+  p3sig usb clone [--drive FROM] [--to PATH]   Copy a vault stick to another blank stick.
+  p3sig dongle add [--root-key usb]   PIN (set if none), resident ES256 ssh:p3sig-policy key
+                             (PIN required), delegated with the root from the vault stick.
+  Key sources: --root-key / --with take usb[:PATH] (finds the stick, asks the passphrase) and
+  --with dongle[:SHA256:…] (this binary asks the PIN and the touch itself).
 
 SIGNED POLICY (what agents accept: root in the safe → delegated dongle/chip keys)
   p3sig policy root --root-key K       Publish the root (once); prints the fingerprint to pin.

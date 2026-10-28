@@ -1,0 +1,3 @@
+# p3sig: let members of plugdev talk to FIDO2 dongles (p3sig dongle add, --with dongle).
+# Without it, on a box with no desktop login the uaccess ACL goes to gdm, not to you.
+KERNEL=="hidraw*", ENV{ID_FIDO_TOKEN}=="1", GROUP="plugdev", MODE="0660"
