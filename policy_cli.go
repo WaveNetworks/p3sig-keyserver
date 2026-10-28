@@ -5,7 +5,9 @@ package main
 //	p3sig policy root     --root-key K            publish the root (once); prints the fingerprint to pin
 //	p3sig policy delegate --root-key K --device D  root lets device D sign policy (enrol a dongle/chip)
 //	p3sig policy revoke   --root-key K --device D  root revokes device D (versioned list, can't be rolled back)
-//	p3sig policy sign     --with S --machine ID|--all   device signs the server's draft after you review it
+//	p3sig policy sign     --with S [--group G]          ONE signature for every machine (account policy, task #2631)
+//	p3sig policy sign     --with S --machine ID|--all   legacy per-machine policies (one signature each)
+//	p3sig policy freshness-delegate / refresh           the freshness key (account_policy_cli.go)
 //	p3sig policy status                            root fp, delegations, revocations, per-machine versions
 //
 // A signer (K, S) is a key FILE (the p3sig base64 vault key or an OpenSSH private
@@ -65,7 +67,10 @@ type policyStatus struct {
 
 func cmdPolicy(sub string, f map[string]string) error {
 	if sub == "" || sub == "help" {
-		return errors.New("usage: p3sig policy root|delegate|revoke|sign|status  (run `p3sig help`)")
+		return errors.New("usage: p3sig policy root|delegate|revoke|sign|status|freshness-delegate|refresh  (run `p3sig help`)")
+	}
+	if sub == "refresh" { // the key server's timer: authenticates with the freshness key, no vault (task #2631)
+		return cmdPolicyRefresh(f)
 	}
 	apiBase, keyPath, err := resolveIdentity(f)
 	if err == nil {
@@ -93,7 +98,7 @@ func cmdPolicy(sub string, f map[string]string) error {
 	switch sub {
 	case "status":
 		return policyStatusCmd(call)
-	case "root", "delegate", "revoke":
+	case "root", "delegate", "revoke", "freshness-delegate":
 		root, err := loadSigner(f["root-key"])
 		if err != nil {
 			return fmt.Errorf("--root-key (the root key from the safe): %w", err)
@@ -106,6 +111,22 @@ func cmdPolicy(sub string, f map[string]string) error {
 			}
 			fmt.Printf("policy root set: %s\nPin it on every machine:  p3sig agent pull --root %s\n"+
 				"and compare it with the fingerprint on the web app's SSH Access page.\n", fp, fp)
+			return nil
+		case "freshness-delegate":
+			k, err := deviceKeyLine(firstNonEmpty(f["freshness-key"], f["device"]))
+			if err != nil {
+				return fmt.Errorf("--freshness-key: %w", err)
+			}
+			exp, err := parseExpiry(firstNonEmpty(f["expires"], "365d"), time.Now())
+			if err != nil {
+				return err
+			}
+			fp, err := policyFreshnessDelegate(call, root, k, firstNonEmpty(f["label"], "freshness"), exp, time.Now())
+			if err != nil {
+				return err
+			}
+			fmt.Printf("freshness key %s delegated — it can only extend how long an owner-signed policy stays valid.\n"+
+				"Run on the key server's timer:  p3sig policy refresh --freshness-key … --account <account> --root <root fp>\n", fp)
 			return nil
 		case "delegate":
 			dev, err := deviceKeyLine(f["device"])
@@ -157,7 +178,8 @@ func cmdPolicy(sub string, f map[string]string) error {
 		} else if f["machine"] != "" {
 			machines = append(machines, f["machine"])
 		} else {
-			return errors.New("usage: p3sig policy sign --machine ID | --all [--with agent[:SHA256:…]|KEYFILE] [--krl-hours 72] [--yes]")
+			// Default (task #2631): ONE signature for the whole account (or --group).
+			return cmdPolicySignAccount(call, dev, f)
 		}
 		in := bufio.NewReader(os.Stdin)
 		review := func(machine string, p Policy) bool {

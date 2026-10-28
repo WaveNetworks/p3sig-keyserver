@@ -1,0 +1,19 @@
+# p3sig freshness refresher (task #2631) — the TUF timestamp role, run on the key
+# server, never on p3sig.com. Vouches that the owner-signed account policy is still
+# current; it cannot change policy content. Fill in /etc/p3sig/freshness.env:
+#   P3SIG_FRESHNESS_KEY=agent:SHA256:…   (or a key file; TPM key via `p3sig ssh-agent`)
+#   P3SIG_ACCOUNT=user:N
+#   P3SIG_ROOT=SHA256:…                  (the pinned policy root)
+#   P3SIG_GROUP=                          (empty = whole account)
+#   P3SIG_WINDOW=36h                      (each statement's validity; refresh every 6h)
+[Unit]
+Description=p3sig account policy freshness refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/p3sig/freshness.env
+Environment=P3SIG_FRESHNESS_STATE=/var/lib/p3sig/freshness-state.json
+ExecStart=/usr/local/bin/p3sig policy refresh
+StateDirectory=p3sig

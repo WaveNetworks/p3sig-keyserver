@@ -776,7 +776,13 @@ SIGNED POLICY (what agents accept: root in the safe → delegated dongle/chip ke
   p3sig policy delegate --root-key K --device D [--label L] [--expires 90d]
                              Let device D sign policy. D = .pub file, key line or agent[:SHA256:…].
   p3sig policy revoke --root-key K --device D|SHA256:…   Revoke a signing device.
-  p3sig policy sign --machine ID|--all [--with agent[:SHA256:…]|KEYFILE] [--krl-hours 72] [--yes]
+  p3sig policy sign [--group G] [--with agent[:SHA256:…]|KEYFILE] [--expires-hours 72] [--yes]
+                             ONE signature for every machine: shows the diff since the last signed version.
+  p3sig policy sign --machine ID|--all [--krl-hours 72]   Legacy per-machine policies (one signature each).
+  p3sig policy freshness-delegate --root-key K --freshness-key PUB [--label L] [--expires 365d]
+                             Root lets a low-privilege key keep policy fresh (it can't change content).
+  p3sig policy refresh --freshness-key K --account user:N --root SHA256:… [--group G] [--window 36h]
+                             Timer job on the key server: verify the signed policy, vouch it is still current.
                              Review the server's draft (CAs, principals, KRL) and sign it on
                              the device. Default --with agent: the dongle (ssh-add) or the
                              chip key (p3sig ssh-agent). The root key is not needed.
