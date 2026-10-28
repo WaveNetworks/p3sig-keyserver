@@ -255,7 +255,10 @@ func agentPullWith(apiBase, machine string, key ed25519.PrivateKey, outDir, root
 	} else if st.RootFP != "" && st.RootFP != rootFP {
 		return fmt.Errorf("root %s differs from the pinned root %s — refusing (re-init deliberately to change roots)", rootFP, st.RootFP)
 	}
-	mandatory := requireSigned || st.Version > 0
+	// A pinned root means signatures are required from the first pull: falling
+	// back to the unsigned path would let a MITM answer "no signed policy" and
+	// have its own CA written.
+	mandatory := requireSigned || st.Version > 0 || rootFP != ""
 
 	if rootFP != "" {
 		var sp SignedPolicy

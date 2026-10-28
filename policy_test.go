@@ -210,3 +210,27 @@ func TestAgentPull_SignedKeepsOldConfigOnFailure(t *testing.T) {
 		}
 	}
 }
+
+// A fresh install with --root pinned (no saved state, no --require-signed) must
+// refuse a server that answers "no signed policy" instead of falling back to the
+// unsigned CA — that fallback is exactly what a MITM would use.
+func TestAgentPull_PinnedRootNeverFallsBackToUnsigned(t *testing.T) {
+	f := newPolicyFixture(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.Form.Get("action") == "getSignedPolicy" {
+			json.NewEncoder(w).Encode(map[string]any{"results": map[string]any{}})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"results": map[string]any{"trusted_user_ca_keys": "evil-unsigned", "grants": []any{}, "krl_spec": ""}})
+	}))
+	defer srv.Close()
+	_, mk, _ := ed25519.GenerateKey(rand.Reader)
+	out := t.TempDir()
+	if err := agentPullWith(srv.URL, "m1", mk, out, f.rootFP, false); err == nil {
+		t.Fatal("pull with a pinned root accepted an unsigned policy")
+	}
+	if _, err := os.Stat(filepath.Join(out, "trusted_user_ca_keys")); err == nil {
+		t.Fatal("unsigned CA file was written despite the pinned root")
+	}
+}
