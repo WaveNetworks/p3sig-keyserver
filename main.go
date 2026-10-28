@@ -764,10 +764,14 @@ SSH (certificate authority)
   p3sig agent install        Print the sshd_config lines to add.
 
 VAULT STICKS + DONGLE (setup in 3 commands; no VeraCrypt, no sudo, no ssh-agent)
-  p3sig usb init [--from KEYFILE] [--drive PATH]
+  p3sig usb init [--from KEYFILE] [--drive PATH] [--register-with KEY]
                              New vault/root key on a blank FAT stick (DAILY), passphrase-wrapped
                              (Argon2id + AES-GCM), then cloned + verified onto SAFE. Resumes an
                              interrupted run; never overwrites a key. --from migrates an old key.
+                             Then registers it (signed by --register-with or your login key; every
+                             secret is copied to it and checked) and publishes the policy root if
+                             the account has none. New account: prints the key to paste at sign-up.
+  p3sig usb register [--drive PATH] [--register-with KEY]   The account step of init, again.
   p3sig usb clone [--drive FROM] [--to PATH]   Copy a vault stick to another blank stick.
   p3sig dongle add [--root-key usb]   PIN (set if none), resident ES256 ssh:p3sig-policy key
                              (PIN required), delegated with the root from the vault stick.

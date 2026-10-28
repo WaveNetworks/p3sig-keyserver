@@ -487,6 +487,11 @@ func userRequest(apiBase, action, keyPath string, extra url.Values, v any) error
 	if err != nil {
 		return err
 	}
+	return userRequestKey(apiBase, action, key, extra, v)
+}
+
+// userRequestKey is userRequest with the vault key already in memory (usb init).
+func userRequestKey(apiBase, action string, key ed25519.PrivateKey, extra url.Values, v any) error {
 	pub := base64.StdEncoding.EncodeToString(key.Public().(ed25519.PublicKey))
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(key, []byte(pub+"|"+ts)))

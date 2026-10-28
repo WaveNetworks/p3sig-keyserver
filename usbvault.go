@@ -20,11 +20,15 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -265,7 +269,16 @@ func cmdUSB(sub string, f map[string]string) error {
 		if _, err := in.ReadString('\n'); err != nil {
 			return nil
 		}
-		return cloneTo(f, in, key)
+		if err := cloneTo(f, in, key); err != nil {
+			return err
+		}
+		return usbRegister(f, key)
+	case "register": // resume the account step later: p3sig usb register [--drive PATH] [--register-with KEY]
+		key, err := usbKey("usb:" + f["drive"])
+		if err != nil {
+			return err
+		}
+		return usbRegister(f, key)
 	case "clone":
 		src, err := pickUSB(map[string]string{"drive": f["drive"]}, in, true, "stick to copy FROM")
 		if err != nil {
@@ -280,7 +293,7 @@ func cmdUSB(sub string, f map[string]string) error {
 		in.ReadString('\n')
 		return cloneTo(map[string]string{"drive": f["to"]}, in, key)
 	}
-	return errors.New("usage: p3sig usb init [--from KEYFILE] [--drive PATH] | p3sig usb clone [--drive FROM] [--to PATH]")
+	return errors.New("usage: p3sig usb init [--from KEYFILE] [--drive PATH] [--register-with KEY] | p3sig usb clone [--drive FROM] [--to PATH] | p3sig usb register [--drive PATH] [--register-with KEY]")
 }
 
 func cloneTo(f map[string]string, in *bufio.Reader, key ed25519.PrivateKey) error {
@@ -297,10 +310,141 @@ func cloneTo(f map[string]string, in *bufio.Reader, key ed25519.PrivateKey) erro
 	}
 	pub, _ := ssh.NewPublicKey(key.Public())
 	fp := ssh.FingerprintSHA256(pub)
-	fmt.Printf("SAFE ready and verified: %s (same key as DAILY). Keep it somewhere else.\n\n"+
-		"Publish it as your policy root (once):  p3sig policy root --root-key usb\n"+
-		"Pin it on every machine:               p3sig agent pull --root %s\n", fp, fp)
+	fmt.Printf("SAFE ready and verified: %s (same key as DAILY). Keep it somewhere else.\n\n", fp)
 	return nil
+}
+
+// usbRegister puts the stick's key on the account and publishes the policy root
+// for an account that has none. A key already on an account is left as is; a new
+// one is added signed by an existing vault key (--register-with, else the saved
+// login identity), then every secret is copied to it and checked. With no key to
+// sign with (a brand-new account) it prints the public key to paste at signup.
+func usbRegister(f map[string]string, key ed25519.PrivateKey) error {
+	apiBase := firstNonEmpty(f["url"], os.Getenv("P3SIG_URL"), defaultAPI)
+	call := func(action string, extra url.Values, v any) error {
+		return userRequestKey(apiBase, action, key, extra, v)
+	}
+	if err := call("whoami", nil, nil); err != nil {
+		existing := f["register-with"]
+		if existing == "" || existing == "true" {
+			if _, kp, ierr := resolveIdentity(map[string]string{"url": f["url"]}); ierr == nil {
+				existing = kp
+			}
+		}
+		if existing == "" {
+			pub := base64.StdEncoding.EncodeToString(key.Public().(ed25519.PublicKey))
+			fmt.Printf("This key is not on a p3sig account yet. Paste its public key at sign-up (or Vault › Keys):\n\n  %s\n\n"+
+				"then run `p3sig usb register` to publish your policy root. Already have a key? "+
+				"`p3sig usb register --register-with <that key or usb:PATH>`.\n", pub)
+			return nil
+		}
+		old, err := loadKey(existing)
+		if err != nil {
+			return fmt.Errorf("--register-with: %w", err)
+		}
+		added, err := addVaultKey(func(action string, extra url.Values, v any) error {
+			return userRequestKey(apiBase, action, old, extra, v)
+		}, old, key, firstNonEmpty(f["label"], "Vault USB"), time.Now())
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Registered on your account; %d secret cop(ies) made for it, and it opens everything.\n", added)
+	} else {
+		fmt.Println("This key is already registered on your account.")
+	}
+	var st policyStatus
+	if err := call("getPolicyStatus", nil, &st); err != nil {
+		return err
+	}
+	signer, err := ssh.NewSignerFromKey(key)
+	if err != nil {
+		return err
+	}
+	fp := ssh.FingerprintSHA256(signer.PublicKey())
+	switch {
+	case st.RootFP == "":
+		if fp, err = policySetRoot(call, signer); err != nil {
+			return err
+		}
+		fmt.Printf("Policy root published: %s\nPin it on every machine:  p3sig agent pull --root %s\n", fp, fp)
+	case st.RootFP == fp:
+		fmt.Printf("Policy root already published: %s\n", fp)
+	default:
+		fmt.Printf("Your account's policy root is %s (another key); left as is.\n", st.RootFP)
+	}
+	return nil
+}
+
+// addVaultKey registers newKey signed by old (addMyVaultKey), then copies every
+// secret old can open to newKey (getResealWork → saveResealed) and checks that no
+// work is left for newKey. Returns how many copies it made.
+func addVaultKey(call policyCall, old, newKey ed25519.PrivateKey, label string, now time.Time) (int, error) {
+	newPub := base64.StdEncoding.EncodeToString(newKey.Public().(ed25519.PublicKey))
+	ts := strconv.FormatInt(now.Unix(), 10)
+	var r struct {
+		KeyID string `json:"key_id"`
+	}
+	if err := call("addMyVaultKey", url.Values{
+		"new_public_key": {newPub}, "label": {label}, "add_ts": {ts},
+		"add_sig": {base64.StdEncoding.EncodeToString(ed25519.Sign(old, []byte("p3sig-add-key|"+newPub+"|"+ts)))},
+	}, &r); err != nil {
+		return 0, err
+	}
+	work := func() ([]resealWork, error) {
+		var res struct {
+			Work []resealWork `json:"work"`
+		}
+		err := call("getResealWork", nil, &res)
+		return res.Work, err
+	}
+	ws, err := work()
+	if err != nil {
+		return 0, err
+	}
+	var out []resealCopy
+	for _, w := range ws {
+		var value string
+		var meta secretMeta
+		opened := false
+		for _, c := range w.Copies {
+			if m, err := openSecretName(c.Meta, old); err == nil {
+				if v, err := openSealedBox(c.Enc, old); err == nil {
+					value, meta, opened = v, m, true
+					break
+				}
+			}
+		}
+		for _, m := range w.Missing {
+			if m.KeyID != r.KeyID {
+				continue
+			}
+			if !opened {
+				return 0, fmt.Errorf("secret %s: none of its copies opens with the signing key", w.SecretID)
+			}
+			c, err := sealSecretFor(value, meta, m.KeyID, m.PublicKey)
+			if err != nil {
+				return 0, err
+			}
+			out = append(out, resealCopy{SecretID: w.SecretID, sealedCopy: c})
+		}
+	}
+	if len(out) > 0 {
+		payload, _ := json.Marshal(out)
+		if err := call("saveResealed", url.Values{"sealed_copies": {string(payload)}}, nil); err != nil {
+			return 0, err
+		}
+	}
+	if ws, err = work(); err != nil {
+		return 0, err
+	}
+	for _, w := range ws {
+		for _, m := range w.Missing {
+			if m.KeyID == r.KeyID {
+				return len(out), fmt.Errorf("check failed: secret %s still has no copy for the new key — run `p3sig usb register` again", w.SecretID)
+			}
+		}
+	}
+	return len(out), nil
 }
 
 // usbKeyCache holds keys already unwrapped from a stick in this process, so a
