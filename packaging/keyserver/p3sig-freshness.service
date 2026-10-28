@@ -5,7 +5,8 @@
 #   P3SIG_ACCOUNT=user:N
 #   P3SIG_ROOT=SHA256:…                  (the pinned policy root)
 #   P3SIG_GROUP=                          (empty = whole account)
-#   P3SIG_WINDOW=36h                      (each statement's validity; refresh every 6h)
+#   P3SIG_WINDOW=                         (empty = the account window set on SSH Access;
+#                                          a longer value is cut to it; refresh every 6h)
 [Unit]
 Description=p3sig account policy freshness refresh
 After=network-online.target

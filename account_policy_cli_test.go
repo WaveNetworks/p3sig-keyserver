@@ -143,3 +143,37 @@ func TestFreshnessRefreshRefuses(t *testing.T) {
 		t.Fatal("window beyond the 7d cap accepted")
 	}
 }
+
+// The refresher takes its window from the account settings; a longer --window is cut to it.
+func TestFreshnessRefreshUsesAccountWindow(t *testing.T) {
+	f := newAccountFixture(t)
+	sp := f.served(t, nil)
+	var fb signedBlob
+	withWindow := func(hours int) func(url.Values, any) error {
+		inner := fakeRefresh(t, sp, &fb)
+		return func(form url.Values, v any) error {
+			if form.Get("action") != "freshnessGetCurrent" {
+				return inner(form, v)
+			}
+			j, _ := json.Marshal(sp)
+			var m map[string]any
+			_ = json.Unmarshal(j, &m)
+			m["settings"] = map[string]int{"window_hours": hours, "refresh_hours": 6}
+			j, _ = json.Marshal(m)
+			return json.Unmarshal(j, v)
+		}
+	}
+	for _, c := range []struct {
+		server int
+		flag   time.Duration
+		want   time.Duration
+	}{{24, 0, 24 * time.Hour}, {24, 36 * time.Hour, 24 * time.Hour}, {48, 12 * time.Hour, 12 * time.Hour}, {0, 0, defaultFreshnessWindow}} {
+		exp, err := freshnessRefresh(withWindow(c.server), f.fresh, "7", "", f.rootFP, c.flag, &refreshState{}, f.now)
+		if err != nil {
+			t.Fatalf("%+v: %v", c, err)
+		}
+		if got := time.Unix(exp, 0).Sub(time.Unix(f.now.Unix(), 0)); got != c.want {
+			t.Fatalf("server %dh flag %s: window %s, want %s", c.server, c.flag, got, c.want)
+		}
+	}
+}

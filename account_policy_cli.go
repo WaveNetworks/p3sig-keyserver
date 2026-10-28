@@ -183,10 +183,16 @@ type refreshState struct {
 	Issued             int64 `json:"issued"`
 }
 
+// defaultFreshnessWindow is used when neither --window nor the account's
+// settings (SSH Access › Freshness settings) give one.
+const defaultFreshnessWindow = 36 * time.Hour
+
 // freshnessRefresh is one timer tick: fetch, verify, vouch, upload. post is
-// postForm(apiBase, …) in the CLI and a fake in tests.
+// postForm(apiBase, …) in the CLI and a fake in tests. window 0 = the
+// account's window from freshnessGetCurrent; a larger --window is cut down to
+// it, because freshnessPut refuses statements longer than the account window.
 func freshnessRefresh(post func(url.Values, any) error, key ssh.Signer, account, group, rootFP string, window time.Duration, st *refreshState, now time.Time) (int64, error) {
-	if window <= 0 || window > maxFreshnessWindow {
+	if window < 0 || window > maxFreshnessWindow {
 		return 0, fmt.Errorf("--window must be between 1m and %s", maxFreshnessWindow)
 	}
 	fp := ssh.FingerprintSHA256(key.PublicKey())
@@ -198,6 +204,9 @@ func freshnessRefresh(post func(url.Values, any) error, key ssh.Signer, account,
 	var cur struct {
 		SignedPolicy
 		PolicyHash string `json:"policy_hash"`
+		Settings   struct {
+			WindowHours int `json:"window_hours"`
+		} `json:"settings"`
 	}
 	if err := post(url.Values{"action": {"freshnessGetCurrent"}, "account": {account}, "group": {group}, "key": {authorizedKey(key.PublicKey())},
 		"ts": {ts}, "auth_sig": {base64.StdEncoding.EncodeToString(ssh.Marshal(asig))}}, &cur); err != nil {
@@ -243,6 +252,11 @@ func freshnessRefresh(post func(url.Values, any) error, key ssh.Signer, account,
 	if cur.PolicyHash != "" && cur.PolicyHash != hash {
 		return 0, fmt.Errorf("server hash %s ≠ computed %s", cur.PolicyHash, hash)
 	}
+	if acct := time.Duration(cur.Settings.WindowHours) * time.Hour; acct > 0 && acct <= maxFreshnessWindow && (window == 0 || window > acct) {
+		window = acct
+	} else if window == 0 {
+		window = defaultFreshnessWindow
+	}
 	f := Freshness{Account: account, Group: group, PolicyHash: hash, Version: ap.Version, Issued: now.Unix(), Expires: now.Add(window).Unix()}
 	if f.Issued <= st.Issued {
 		f.Issued = st.Issued + 1 // server refuses a statement not newer than the stored one
@@ -273,13 +287,13 @@ func cmdPolicyRefresh(f map[string]string) error {
 		}
 	}
 	if f["account"] == "" || f["root"] == "" || f["freshness-key"] == "" {
-		return errors.New("usage: p3sig policy refresh --freshness-key agent[:SHA256:…]|KEYFILE --account user:N --root SHA256:… [--group G] [--window 36h] [--url API]")
+		return errors.New("usage: p3sig policy refresh --freshness-key agent[:SHA256:…]|KEYFILE --account user:N --root SHA256:… [--group G] [--window 36h, default: the account window] [--url API]")
 	}
 	key, err := loadSigner(f["freshness-key"])
 	if err != nil {
 		return fmt.Errorf("--freshness-key: %w", err)
 	}
-	window := 36 * time.Hour
+	var window time.Duration // 0 = the account's window (server settings)
 	if w := f["window"]; w != "" {
 		if window, err = time.ParseDuration(w); err != nil {
 			return fmt.Errorf("--window %q: %w", w, err)
