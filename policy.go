@@ -84,7 +84,13 @@ type SignedPolicy struct {
 	Chain       []signedBlob `json:"chain"`
 	Revocations *signedBlob  `json:"revocations,omitempty"`
 	Policy      signedBlob   `json:"policy"`
-	Signer      string       `json:"signer"` // device key that signed Policy
+	Signer      string       `json:"signer"` // device key that signed Policy (or AccountPolicy)
+
+	// Account-wide format (task #2631). Old agents ignore these fields.
+	AccountPolicy   *signedBlob  `json:"account_policy,omitempty"`
+	Freshness       *signedBlob  `json:"freshness,omitempty"`
+	FreshnessSigner string       `json:"freshness_signer,omitempty"`
+	FreshnessChain  []signedBlob `json:"freshness_chain,omitempty"`
 }
 
 type policyState struct {
@@ -92,6 +98,7 @@ type policyState struct {
 	Version            int64  `json:"version"`
 	RevocationsVersion int64  `json:"revocations_version"`
 	KRLExpires         int64  `json:"krl_expires"`
+	Format             string `json:"format,omitempty"` // "" = per-machine, "account" = account-wide (task #2631)
 }
 
 var errStaleKRL = errors.New("signed KRL has expired — keeping the last good config")
@@ -160,33 +167,10 @@ func parseKey(line string) (ssh.PublicKey, error) {
 // verifySignedPolicy checks sp against the pinned root fingerprint and the last
 // state this agent accepted. It returns the policy only when every check passes.
 func verifySignedPolicy(sp *SignedPolicy, rootFP string, st policyState, now time.Time) (*Policy, error) {
-	if rootFP == "" {
-		return nil, errors.New("no root fingerprint pinned (p3sig agent pull --root SHA256:…)")
-	}
-	root, err := parseKey(sp.RootKey)
+	root, revoked, err := verifyRootAndRevocations(sp, rootFP, st)
 	if err != nil {
-		return nil, fmt.Errorf("root key: %w", err)
+		return nil, err
 	}
-	if got := ssh.FingerprintSHA256(root); got != rootFP {
-		return nil, fmt.Errorf("root key %s is not the pinned root %s", got, rootFP)
-	}
-
-	revoked := map[string]bool{}
-	if sp.Revocations != nil {
-		var r Revocations
-		if err := openSignedBlob(root, ctxRevocations, *sp.Revocations, &r); err != nil {
-			return nil, fmt.Errorf("revocations: %w", err)
-		}
-		if r.Version < st.RevocationsVersion {
-			return nil, fmt.Errorf("revocation list v%d is older than v%d already seen (replay)", r.Version, st.RevocationsVersion)
-		}
-		for _, fp := range r.Revoked {
-			revoked[fp] = true
-		}
-	} else if st.RevocationsVersion > 0 {
-		return nil, errors.New("revocation list missing after one was seen (stripped)")
-	}
-
 	signer, err := parseKey(sp.Signer)
 	if err != nil {
 		return nil, fmt.Errorf("signer key: %w", err)
@@ -195,25 +179,10 @@ func verifySignedPolicy(sp *SignedPolicy, rootFP string, st policyState, now tim
 	if revoked[signerFP] {
 		return nil, fmt.Errorf("signing device %s has been revoked", signerFP)
 	}
-
 	// The signer must hold a live root delegation; collect the accounts it covers.
-	accounts := map[string]bool{}
-	for i, b := range sp.Chain {
-		var d Delegation
-		if err := openSignedBlob(root, ctxDelegation, b, &d); err != nil {
-			return nil, fmt.Errorf("delegation %d: %w", i, err)
-		}
-		dk, err := parseKey(d.DeviceKey)
-		if err != nil || ssh.FingerprintSHA256(dk) != signerFP {
-			continue
-		}
-		if d.Expires != 0 && now.Unix() >= d.Expires {
-			continue
-		}
-		accounts[d.Account] = true
-	}
-	if len(accounts) == 0 {
-		return nil, fmt.Errorf("signing device %s has no live delegation from the root", signerFP)
+	accounts, err := liveDelegations(root, sp.Chain, signerFP, now)
+	if err != nil {
+		return nil, err
 	}
 
 	var p Policy
@@ -239,7 +208,10 @@ func verifySignedPolicy(sp *SignedPolicy, rootFP string, st policyState, now tim
 
 // nextState is the state to persist after p (and its revocation list) was applied.
 func nextState(sp *SignedPolicy, rootFP string, p *Policy, prev policyState) policyState {
-	st := policyState{RootFP: rootFP, Version: p.Version, KRLExpires: p.KRLExpires, RevocationsVersion: prev.RevocationsVersion}
+	st := policyState{RootFP: rootFP, Version: p.Version, KRLExpires: p.KRLExpires, RevocationsVersion: prev.RevocationsVersion, Format: prev.Format}
+	if sp.AccountPolicy != nil && sp.AccountPolicy.Payload != "" {
+		st.Format = formatAccount
+	}
 	if sp.Revocations != nil {
 		var r Revocations
 		if b, err := base64.StdEncoding.DecodeString(sp.Revocations.Payload); err == nil && json.Unmarshal(b, &r) == nil {

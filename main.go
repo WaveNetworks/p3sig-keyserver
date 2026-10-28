@@ -277,9 +277,10 @@ func agentPullWith(apiBase, machine string, key ed25519.PrivateKey, outDir, root
 	if rootFP != "" {
 		var sp SignedPolicy
 		err := pullInto(apiBase, "getSignedPolicy", machine, key, nil, &sp)
-		if err == nil && sp.Policy.Payload != "" {
-			p, verr := verifySignedPolicy(&sp, rootFP, st, time.Now())
+		if err == nil && (sp.Policy.Payload != "" || sp.AccountPolicy != nil) {
+			p, verr := verifyPolicyAny(&sp, rootFP, machine, st, time.Now())
 			if verr != nil {
+				reportPolicyStatus(apiBase, machine, key, "refused", verr.Error(), st)
 				return fmt.Errorf("signed policy REJECTED, old config kept: %w", verr)
 			}
 			if err := writeSSHFiles(outDir, strings.Join(p.CAKeys, "\n"), p.Grants, p.KRLSpec); err != nil {
@@ -288,7 +289,8 @@ func agentPullWith(apiBase, machine string, key ed25519.PrivateKey, outDir, root
 			if err := savePolicyState(outDir, nextState(&sp, rootFP, p, st)); err != nil {
 				return err
 			}
-			fmt.Printf("pulled signed policy v%d: %d CA(s), %d principal grant(s) → %s\n", p.Version, len(p.CAKeys), len(p.Grants), outDir)
+			reportPolicyStatus(apiBase, machine, key, "applied", "", nextState(&sp, rootFP, p, st))
+			fmt.Printf("pulled signed policy v%d: %d CA(s), %d principal grant(s), valid until %s → %s\n", p.Version, len(p.CAKeys), len(p.Grants), time.Unix(p.KRLExpires, 0).UTC().Format(time.RFC3339), outDir)
 			return nil
 		}
 		if mandatory {
@@ -816,4 +818,18 @@ CONFIG & OVERRIDES
 
 Auth is a stateless signed request: Ed25519 over "<machine_id>|<unix_ts>".
 `)
+}
+
+// reportPolicyStatus tells the dashboard what this agent applied or refused
+// (task #2631), so a stale/refused policy is seen there, not only in local logs.
+// Best effort: a server that doesn't know the action yet is ignored.
+func reportPolicyStatus(apiBase, machine string, key ed25519.PrivateKey, status, detail string, st policyState) {
+	extra := url.Values{}
+	extra.Set("status", status)
+	extra.Set("detail", detail)
+	extra.Set("version", strconv.FormatInt(st.Version, 10))
+	extra.Set("format", firstNonEmpty(st.Format, "machine"))
+	extra.Set("valid_until", strconv.FormatInt(st.KRLExpires, 10))
+	var out map[string]any
+	_ = pullInto(apiBase, "reportPolicyStatus", machine, key, extra, &out)
 }
