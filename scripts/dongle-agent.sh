@@ -31,6 +31,7 @@ chmod 700 "$ASKPASS"
 rm -f "$SOCK"
 export P3SIG_PIN_TTY=$(tty) SSH_ASKPASS=$ASKPASS SSH_ASKPASS_REQUIRE=force DISPLAY=${DISPLAY:-:0}
 ( sleep 1; SSH_AUTH_SOCK=$SOCK ssh-add "$KEY" </dev/null && \
-  echo "Dongle key loaded. In another shell: export SSH_AUTH_SOCK=$SOCK" ) &
+  echo "Dongle key loaded. In another shell: export SSH_AUTH_SOCK=$SOCK"; \
+  echo "Waiting for signing requests (PIN prompts appear here). Ctrl-C when done." ) &
 echo "Agent on $SOCK — leave this running; PIN prompts appear here. Ctrl-C to stop."
 ssh-agent -D -a "$SOCK" >/dev/null
