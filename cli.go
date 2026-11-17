@@ -622,7 +622,11 @@ func cmdSecretSet(f map[string]string, name string) error {
 
 func cmdSecretGetUser(f map[string]string, name string) error {
 	if name == "" {
-		return fmt.Errorf("usage: p3sig secret get NAME")
+		return fmt.Errorf("usage: p3sig secret get NAME [--with dongle]")
+	}
+	if withDongle(f) {
+		apiBase, _, _ := resolveIdentity(f) // no key file needed: the key is on the dongle
+		return dongleSecretGet(apiBase, name)
 	}
 	apiBase, keyPath, err := resolveIdentity(f)
 	if err != nil {

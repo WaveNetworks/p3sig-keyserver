@@ -729,7 +729,8 @@ MANAGE (your account — signs with your vault USB key)
                              CLIENT-SIDE, only ciphertext uploaded. Value via stdin or
                              prompt (never argv). Machines granted the bundle get it when
                              you re-seal (browser "Seal now", or below — signed).
-  p3sig secret get NAME      Fetch + unseal one of your secrets locally.
+  p3sig secret get NAME      Fetch + unseal one of your secrets locally
+                             (--with dongle: signed + unsealed on our dongle).
   p3sig secret reseal --with agent[:SHA256:…]|KEYFILE
                              Re-seal every machine copy of your secrets SIGNED by a
                              delegated device (sign-then-seal), so agents with a pinned
