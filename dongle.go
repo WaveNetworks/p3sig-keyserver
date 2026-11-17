@@ -196,6 +196,9 @@ func pinPrompt() func() (string, error) {
 // loadDongleSigner is `--with dongle[:SHA256:…]`: the resident ssh:p3sig-policy
 // credential on the plugged-in dongle.
 func loadDongleSigner(fp string) (ssh.Signer, error) {
+	if rec, err := loadP3Record(); err == nil {
+		return loadP3Signer(rec, fp) // our own firmware (dongle_p3_cli.go)
+	}
 	d, err := findDongle()
 	if err != nil {
 		return nil, err
@@ -226,6 +229,9 @@ func loadDongleSigner(fp string) (ssh.Signer, error) {
 // cmdDongle: p3sig dongle add [--root-key usb] — set the PIN if none, create the
 // resident ES256 ssh:p3sig-policy key (PIN required), delegate it with the root.
 func cmdDongle(sub string, f map[string]string) error {
+	if sub == "pair" || sub == "status" || sub == "unpair" {
+		return cmdDongleP3(sub, f)
+	}
 	if sub != "add" {
 		return errors.New("usage: p3sig dongle add [--root-key usb|usb:PATH|KEYFILE] [--expires 365d]")
 	}

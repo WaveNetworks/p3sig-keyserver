@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/ssh"
 )
 
 type simDongle struct {
@@ -177,5 +178,47 @@ func TestDongleP3EndToEnd(t *testing.T) {
 	d.do('P', nil)
 	if err := DongleUnpair(usb); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// `--with dongle` on our firmware: pair over USB (record + unlock key saved
+// apart), then loadDongleSigner signs over "BLE" and ssh verifies it.
+func TestDongleP3WithDongle(t *testing.T) {
+	d := startSim(t)
+	dir := t.TempDir()
+	t.Setenv("P3SIG_DONGLE_RECORD", dir+"/cfg/dongle-p3.json")
+	t.Setenv("P3SIG_DONGLE_UNLOCK", "")
+	p3OpenBLE = func(string) (DongleLink, io.Closer, error) {
+		d.do('C', nil)
+		return simLink{d, 'B'}, io.NopCloser(nil), nil
+	}
+	defer func() { p3OpenBLE = OpenDongleBLE }()
+
+	if _, err := p3Pair(simLink{d, 'U'}, "AA:BB:CC:DD:EE:FF", dir+"/cfg/unlock.key", nil); err == nil {
+		t.Fatal("unlock key next to the record accepted")
+	}
+	p, err := p3Pair(simLink{d, 'U'}, "AA:BB:CC:DD:EE:FF", dir+"/phone/unlock.key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadDongleSigner("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(s.PublicKey().(ssh.CryptoPublicKey).CryptoPublicKey().(ed25519.PublicKey), p.VaultEd) {
+		t.Fatal("signer is not the vault key")
+	}
+	msg := bytes.Repeat([]byte("policy "), 300)
+	sig, err := s.Sign(rand.Reader, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PublicKey().Verify(msg, sig); err != nil {
+		t.Fatal(err)
+	}
+	// Without the phone's share the dongle stays locked.
+	os.Remove(dir + "/phone/unlock.key")
+	if _, err := loadDongleSigner(""); err == nil {
+		t.Fatal("signed without the unlock key")
 	}
 }
