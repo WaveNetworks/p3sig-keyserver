@@ -194,6 +194,8 @@ func main() {
 		} else {
 			err = cmdDongle(sub, parseFlags(rest))
 		}
+	case "doctor":
+		err = cmdDoctor(parseFlags(os.Args[2:]))
 	case "setup":
 		err = cmdSetup(parseFlags(os.Args[2:]))
 	case "ssh-agent":
@@ -763,6 +765,15 @@ SSH (certificate authority)
                              is written, older versions are refused (also P3SIG_ROOT)
       --require-signed       refuse unsigned policy even before the first signed pull
   p3sig agent install        Print the sshd_config lines to add.
+
+CHECK EVERYTHING (read-only; changes nothing)
+  p3sig doctor [--drive PATH[,PATH]] [--json] [--no-dongle] [--no-unlock]
+                             Proves your vault sticks, dongle and account match: unlocks each
+                             plugged stick, signs in with it, opens one sealed secret locally
+                             (value never shown), counts secrets missing a copy, checks the
+                             policy root, delegated devices, the dongle and every machine.
+                             PASS/FAIL/WARN per line, then a numbered fix list. Exit 2 = not
+                             all pass. Old VeraCrypt sticks: open first or run p3sig usb migrate.
 
 VAULT STICKS + DONGLE (setup in 3 commands; no VeraCrypt, no sudo, no ssh-agent)
   p3sig usb init [--from KEYFILE] [--drive PATH] [--register-with KEY]
