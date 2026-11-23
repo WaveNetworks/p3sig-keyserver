@@ -229,7 +229,7 @@ func loadDongleSigner(fp string) (ssh.Signer, error) {
 // cmdDongle: p3sig dongle add [--root-key usb] — set the PIN if none, create the
 // resident ES256 ssh:p3sig-policy key (PIN required), delegate it with the root.
 func cmdDongle(sub string, f map[string]string) error {
-	if sub == "pair" || sub == "status" || sub == "unpair" {
+	if sub == "pair" || sub == "status" || sub == "unpair" || sub == "rekey" {
 		return cmdDongleP3(sub, f)
 	}
 	if sub != "add" {

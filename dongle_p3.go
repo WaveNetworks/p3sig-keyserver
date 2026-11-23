@@ -42,6 +42,8 @@ const (
 
 	p3OpPair, p3OpInfo, p3OpUnpair                          = 0x01, 0x02, 0x03
 	p3OpUnlock, p3OpLock, p3OpPubkeys, p3OpSign, p3OpUnseal = 0x10, 0x11, 0x12, 0x13, 0x14
+	p3OpRekey                                               = 0x15
+	p3StAuth, p3StConfirm                                   = 2, 7
 	p3SignFirst, p3SignLast                                 = 0x01, 0x02
 )
 
@@ -49,11 +51,22 @@ var p3Status = []string{"ok", "locked", "wrong unlock key or tampered record", "
 	"too big", "not paired", "already paired (unpair first)", "press the dongle button first",
 	"low-order key refused", "flash or RNG failure"}
 
-func p3Err(st byte) error {
-	if int(st) < len(p3Status) {
-		return fmt.Errorf("dongle: %s", p3Status[st])
+// p3StatusError is a refusal the dongle answered with (its status byte).
+type p3StatusError struct{ st byte }
+
+func (e *p3StatusError) Error() string {
+	if int(e.st) < len(p3Status) {
+		return "dongle: " + p3Status[e.st]
 	}
-	return fmt.Errorf("dongle: status %d", st)
+	return fmt.Sprintf("dongle: status %d", e.st)
+}
+
+func p3Err(st byte) error { return &p3StatusError{st} }
+
+// p3IsStatus: err is the dongle refusing with status st.
+func p3IsStatus(err error, st byte) bool {
+	var se *p3StatusError
+	return errors.As(err, &se) && se.st == st
 }
 
 // ---- Noise_KK_25519_ChaChaPoly_BLAKE2b, initiator side ----
@@ -338,6 +351,27 @@ func (s *DongleSession) Sign(msg []byte) ([]byte, error) {
 			}
 			return r, nil
 		}
+	}
+}
+
+// Rekey (task #2829) re-seals the SAME vault key under newKey and, when
+// newHostPub is set, re-pins this host's Noise static key. The dongle needs the
+// session UNLOCKed with the current key and a button press in the last 10 s;
+// while it answers "press the button", wait(i) is asked whether to try again
+// (it prompts and sleeps). The dongle locks itself afterwards: confirm with a
+// fresh session + UNLOCK under the new key.
+func (s *DongleSession) Rekey(newKey [32]byte, newHostPub []byte, wait func(attempt int) bool) error {
+	if newHostPub != nil && len(newHostPub) != 32 {
+		return errors.New("dongle: new host key must be 32 bytes")
+	}
+	req := append(append([]byte{p3OpRekey}, newKey[:]...), newHostPub...)
+	defer wipeBytes(req)
+	for i := 0; ; i++ {
+		_, err := s.call(req)
+		if p3IsStatus(err, p3StConfirm) && wait != nil && wait(i) {
+			continue
+		}
+		return err
 	}
 }
 

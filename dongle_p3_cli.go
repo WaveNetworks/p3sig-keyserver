@@ -6,6 +6,8 @@ package main
 //	                  [--import VAULTKEY] [--root-key usb|…] [--expires 365d]
 //	p3sig dongle status
 //	p3sig dongle unpair [--usb PATH]      (press the dongle button first)
+//	p3sig dongle rekey [--unlock-out NEW_PATH] [--new-host-key]   (task #2829,
+//	                  dongle_p3_rekey.go: new unlock key, same vault key)
 //
 // Pairing (USB) hands the dongle this host's Noise static and a fresh 256-bit
 // unlock key, then saves the PAIRING RECORD (host Noise key, pinned dongle
@@ -43,6 +45,12 @@ type p3Record struct {
 	VaultX       string `json:"vault_x25519"`
 	BLE          string `json:"ble"`
 	UnlockPath   string `json:"unlock_path"`
+	// A `dongle rekey` in flight (task #2829), saved BEFORE the dongle is asked:
+	// the new unlock key's file, where it ends up, and the new host Noise key.
+	// openP3Session falls back to them, and `dongle rekey` settles them.
+	NextUnlockPath  string `json:"next_unlock_path,omitempty"`
+	NextUnlockFinal string `json:"next_unlock_final,omitempty"`
+	NextHostSK      string `json:"next_host_noise_sk,omitempty"`
 }
 
 // Links are variables so tests can put the firmware simulator behind them.
@@ -188,21 +196,55 @@ func openP3Session(rec *p3Record) (*DongleSession, ed25519.PublicKey, [32]byte, 
 		return nil, nil, x, nil, err
 	}
 	defer wipeBytes(hostSK[:])
+	up := firstNonEmpty(os.Getenv("P3SIG_DONGLE_UNLOCK"), rec.UnlockPath)
+	unlock, uerr := readUnlockKey(up)
+	defer wipeBytes(unlock[:])
+	if uerr == nil {
+		s, ed, x, c, err := openP3SessionKeys(rec, hostSK, unlock)
+		if err == nil || rec.NextUnlockPath == "" {
+			return s, ed, x, c, err
+		}
+	} else if rec.NextUnlockPath == "" {
+		return nil, nil, x, nil, uerr
+	}
+	// A rekey was cut short after the dongle may have switched: try the new keys.
+	nk, err := readUnlockKey(rec.NextUnlockPath)
+	if err != nil {
+		return nil, nil, x, nil, fmt.Errorf("%v; and the pending rekey key: %w", uerr, err)
+	}
+	defer wipeBytes(nk[:])
+	nh := hostSK
+	if rec.NextHostSK != "" {
+		if nh, err = b64to32(rec.NextHostSK, "pending host key in the record"); err != nil {
+			return nil, nil, x, nil, err
+		}
+		defer wipeBytes(nh[:])
+	}
+	s, ed, x, c, err := openP3SessionKeys(rec, nh, nk)
+	if err == nil {
+		fmt.Fprintln(os.Stderr, "note: a `p3sig dongle rekey` was interrupted after the dongle switched; run it again to finish")
+	}
+	return s, ed, x, c, err
+}
+
+// readUnlockKey reads a base64 unlock key file (the phone's / vault stick's share).
+func readUnlockKey(path string) (k [32]byte, err error) {
+	ub, err := os.ReadFile(path)
+	if err != nil {
+		return k, fmt.Errorf("dongle unlock key (%s): %w — it lives on the phone/vault stick; mount it or set P3SIG_DONGLE_UNLOCK", path, err)
+	}
+	defer wipeBytes(ub)
+	return b64to32(string(ub), "unlock key")
+}
+
+// openP3SessionKeys: BLE connect, Noise_KK as hostSK, UNLOCK with unlock, and
+// check the dongle still holds the paired vault key.
+func openP3SessionKeys(rec *p3Record, hostSK, unlock [32]byte) (*DongleSession, ed25519.PublicKey, [32]byte, io.Closer, error) {
+	var x [32]byte
 	static, err := b64to32(rec.DongleStatic, "dongle static in the record")
 	if err != nil {
 		return nil, nil, x, nil, err
 	}
-	up := firstNonEmpty(os.Getenv("P3SIG_DONGLE_UNLOCK"), rec.UnlockPath)
-	ub, err := os.ReadFile(up)
-	if err != nil {
-		return nil, nil, x, nil, fmt.Errorf("dongle unlock key (%s): %w — it lives on the phone/vault stick; mount it or set P3SIG_DONGLE_UNLOCK", up, err)
-	}
-	unlock, err := b64to32(string(ub), "unlock key")
-	wipeBytes(ub)
-	if err != nil {
-		return nil, nil, x, nil, err
-	}
-	defer wipeBytes(unlock[:])
 	link, c, err := p3OpenBLE(rec.BLE)
 	if err != nil {
 		return nil, nil, x, nil, err
@@ -295,6 +337,15 @@ func cmdDongleP3(sub string, f map[string]string) error {
 		pub, _ := ssh.NewPublicKey(ed)
 		fmt.Printf("dongle %s: paired, unlocks, vault key %s\n", rec.BLE, ssh.FingerprintSHA256(pub))
 		return nil
+	case "rekey":
+		ed, path, err := p3Rekey(f["unlock-out"], f["new-host-key"] == "true", p3WaitPress)
+		if err != nil {
+			return err
+		}
+		pub, _ := ssh.NewPublicKey(ed)
+		fmt.Printf("unlock key rotated: the new key is %s; the old one is refused by the dongle (its file was renamed to .old)\n"+
+			"vault key unchanged: %s (delegations and sealed secrets stay valid)\n", path, ssh.FingerprintSHA256(pub))
+		return nil
 	case "unpair":
 		usb, c, err := p3OpenUSB(f["usb"])
 		if err != nil {
@@ -312,5 +363,5 @@ func cmdDongleP3(sub string, f map[string]string) error {
 		fmt.Println("dongle unpaired; revoke its key with `p3sig policy revoke --device SHA256:…`")
 		return nil
 	}
-	return errors.New("usage: p3sig dongle add | pair --ble ADDR --unlock-out PATH [--usb PATH] [--import VAULTKEY] | status | unpair")
+	return errors.New("usage: p3sig dongle add | pair --ble ADDR --unlock-out PATH [--usb PATH] [--import VAULTKEY] | status | unpair | rekey [--unlock-out NEW_PATH] [--new-host-key]")
 }

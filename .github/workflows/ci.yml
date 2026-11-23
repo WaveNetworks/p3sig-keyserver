@@ -11,6 +11,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # nokemo ci_local.py runs this on a builder/ci-<sha> branch before pushing main.
+  workflow_dispatch:
 
 permissions:
   contents: read

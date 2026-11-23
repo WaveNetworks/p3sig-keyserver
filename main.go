@@ -780,6 +780,10 @@ VAULT STICKS + DONGLE (setup in 3 commands; no VeraCrypt, no sudo, no ssh-agent)
                              Our own firmware: USB pairing, unlock key to PATH (phone/vault stick,
                              not this disk), vault Ed25519 key delegated. Then --with dongle signs
                              over BLE. p3sig dongle status | unpair (button press).
+  p3sig dongle rekey [--unlock-out NEW_PATH] [--new-host-key]
+                             Rotate the unlock key (and this host's pairing key) without
+                             re-pairing: same vault key, no re-delegation. Press the button;
+                             the old key file is kept as .old once the new one is confirmed.
   Key sources: --root-key / --with take usb[:PATH] (finds the stick, asks the passphrase) and
   so does --key / P3SIG_VAULT_KEY (login, secret, vault: asked once per command), and
   --with dongle[:SHA256:…] (this binary asks the PIN and the touch itself).
