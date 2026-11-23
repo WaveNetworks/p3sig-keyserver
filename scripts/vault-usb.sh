@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# BUILDER/CI ONLY (task #2831): owners and customers never run this. Everything a person does is a
+# `p3sig` subcommand (old VeraCrypt sticks: `p3sig usb migrate`; checks: `p3sig doctor`; dongle: `p3sig dongle pair`).
 # SUPERSEDED (task #2630): use the `usb` key source (`--key usb`, `--root-key usb`, `--with usb`); keep this only to open an old VeraCrypt stick for `p3sig usb init --from KEYFILE`.
 # vault-usb.sh — open / close a p3sig vault USB made by make-vault-usbs.sh.
 #   sudo scripts/vault-usb.sh open  [PARTITION]   (default: the drive labelled P3SIG-DAILY)

@@ -48,7 +48,11 @@ var usbIgnorable = map[string]bool{
 }
 
 // usbState: "p3sig" (holds a key — resume), "blank", or an error for a used drive.
-func usbState(drive string) (string, error) {
+func usbState(drive string) (string, error) { return usbStateAllow(drive, nil) }
+
+// usbStateAllow is usbState that also treats the files in allow as leftovers:
+// `usb migrate` writes the new key next to an old VeraCrypt container.
+func usbStateAllow(drive string, allow map[string]bool) (string, error) {
 	if _, err := os.Stat(usbKeyPath(drive)); err == nil {
 		return "p3sig", nil
 	}
@@ -57,7 +61,7 @@ func usbState(drive string) (string, error) {
 		return "", err
 	}
 	for _, e := range ents {
-		if usbIgnorable[e.Name()] {
+		if usbIgnorable[e.Name()] || allow[e.Name()] {
 			continue
 		}
 		if e.Name() == usbDir { // interrupted before the key landed: only leftovers inside
@@ -130,7 +134,11 @@ func readUSBKey(drive string, passphrase []byte) (ed25519.PrivateKey, error) {
 // read back from the stick must unwrap to the same key. A drive that already
 // holds a key is resumed instead: it must unwrap (with passphrase) to key.
 func storeOnUSB(drive string, key ed25519.PrivateKey, passphrase []byte, p Argon2Params) error {
-	st, err := usbState(drive)
+	return storeOnUSBAllow(drive, key, passphrase, p, nil)
+}
+
+func storeOnUSBAllow(drive string, key ed25519.PrivateKey, passphrase []byte, p Argon2Params, allow map[string]bool) error {
+	st, err := usbStateAllow(drive, allow)
 	if err != nil {
 		return err
 	}
@@ -279,6 +287,8 @@ func cmdUSB(sub string, f map[string]string) error {
 			return err
 		}
 		return usbRegister(f, key)
+	case "migrate":
+		return cmdUSBMigrate(f, in)
 	case "clone":
 		src, err := pickUSB(map[string]string{"drive": f["drive"]}, in, true, "stick to copy FROM")
 		if err != nil {
@@ -293,7 +303,7 @@ func cmdUSB(sub string, f map[string]string) error {
 		in.ReadString('\n')
 		return cloneTo(map[string]string{"drive": f["to"]}, in, key)
 	}
-	return errors.New("usage: p3sig usb init [--from KEYFILE] [--drive PATH] [--register-with KEY] | p3sig usb clone [--drive FROM] [--to PATH] | p3sig usb register [--drive PATH] [--register-with KEY]")
+	return errors.New("usage: p3sig usb init [--from KEYFILE] [--drive PATH] [--register-with KEY] | p3sig usb migrate [--drive PATH] [--key-file PATH] | p3sig usb migrate --finish | p3sig usb clone [--drive FROM] [--to PATH] | p3sig usb register [--drive PATH] [--register-with KEY]")
 }
 
 func cloneTo(f map[string]string, in *bufio.Reader, key ed25519.PrivateKey) error {

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# BUILDER/CI ONLY (task #2831): owners and customers never run this. Everything a person does is a
+# `p3sig` subcommand (old VeraCrypt sticks: `p3sig usb migrate`; checks: `p3sig doctor`; dongle: `p3sig dongle pair`).
 # hw-acceptance.sh — the owner's real-hardware run for task #2630 (vault sticks + dongle).
 #
 # Everything here is the shipped CLI; this script only puts the steps in order, makes sure

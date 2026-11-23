@@ -52,6 +52,7 @@ type doctorStick struct {
 	FP     string             `json:"fingerprint"`
 	Key    ed25519.PrivateKey `json:"-"` // nil = not unlocked
 	Note   string             `json:"note,omitempty"`
+	Legacy bool               `json:"veracrypt_container_left,omitempty"` // usb: format, .hc still beside it
 }
 
 type doctorDongle struct {
@@ -154,13 +155,17 @@ func runDoctor(in doctorInput) doctorReport {
 		case s.Key != nil:
 			unlocked++
 			r.add("sticks", "PASS", fmt.Sprintf("%s [%s] unlocks: %s", stickName(s), s.Format, s.FP), "")
+			if s.Legacy {
+				r.add("sticks", "WARN", stickName(s)+" still has the old VeraCrypt container beside the new key",
+					"once both sticks are migrated: p3sig usb migrate --finish")
+			}
 			if s.Format == "veracrypt" {
-				r.add("sticks", "WARN", stickName(s)+" is still the old VeraCrypt format (needs root to open)",
+				r.add("sticks", "WARN", stickName(s)+" is still the old VeraCrypt format",
 					"p3sig usb migrate --drive "+s.Drive)
 			}
 		case s.Format == "veracrypt":
 			sticksOK = false
-			r.add("sticks", "FAIL", fmt.Sprintf("%s is the old VeraCrypt format and is not open, so its key can't be checked (public key %s)", stickName(s), firstNonEmpty(s.FP, "unknown")),
+			r.add("sticks", "FAIL", fmt.Sprintf("%s is the old VeraCrypt format and did not open (%s), so its key can't be checked (public key %s)", stickName(s), firstNonEmpty(s.Note, "skipped"), firstNonEmpty(s.FP, "unknown")),
 				"p3sig usb migrate --drive "+s.Drive)
 		default:
 			sticksOK = false
@@ -547,6 +552,9 @@ func findSticks(f map[string]string) []doctorStick {
 		s := doctorStick{Drive: d, Label: stickLabel(d)}
 		if _, err := os.Stat(usbKeyPath(d)); err == nil {
 			s.Format = "usb"
+			if _, err := os.Stat(filepath.Join(d, vcContainerFile)); err == nil {
+				s.Legacy = true
+			}
 			if b, err := os.ReadFile(filepath.Join(d, usbDir, usbPubFile)); err == nil {
 				_, s.FP = pubFromText(b)
 			}
@@ -582,14 +590,20 @@ func unlockSticks(sticks []doctorStick, f map[string]string, ask func(string) (s
 			}
 			s.Key = k
 		case "veracrypt":
+			// An already-open container (old vault-usb.sh), else open it in memory.
 			path := firstNonEmpty(f["vc-key"], vcOpenKeyPath)
-			k, err := loadKeyFile(path)
-			if err != nil {
-				s.Note = "container not open"
+			if k, err := loadKeyFile(path); err == nil && (s.FP == "" || edFP(k.Public().(ed25519.PublicKey)) == s.FP) {
+				s.Key = k
+				break
+			}
+			p, err := ask(fmt.Sprintf("%s VeraCrypt passphrase (Enter to skip): ", firstNonEmpty(s.Label, s.Drive)))
+			if err != nil || p == "" {
+				s.Note = "skipped"
 				continue
 			}
-			if s.FP != "" && edFP(k.Public().(ed25519.PublicKey)) != s.FP {
-				s.Note = "the open VeraCrypt key (" + path + ") is not this stick's key"
+			k, err := readVCKey(filepath.Join(s.Drive, vcContainerFile), []byte(p))
+			if err != nil {
+				s.Note = err.Error()
 				continue
 			}
 			s.Key = k

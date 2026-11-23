@@ -784,6 +784,13 @@ VAULT STICKS + DONGLE (setup in 3 commands; no VeraCrypt, no sudo, no ssh-agent)
                              secret is copied to it and checked) and publishes the policy root if
                              the account has none. New account: prints the key to paste at sign-up.
   p3sig usb register [--drive PATH] [--register-with KEY]   The account step of init, again.
+  p3sig usb migrate [--drive PATH] [--key-file PATH]
+                             An old VeraCrypt stick (p3sig-vault.hc) to this format ON THE SAME
+                             stick: opens the container itself in memory (no VeraCrypt, no mount,
+                             no sudo), checks the key against PUBLIC-KEY.txt, writes + verifies the
+                             wrapped key next to it. Run once per stick (DAILY, then SAFE).
+  p3sig usb migrate --finish  Remove the old containers: both sticks plugged, migrated, and the
+                             doctor's stick/account/secret checks passing.
   p3sig usb clone [--drive FROM] [--to PATH]   Copy a vault stick to another blank stick.
   p3sig dongle add [--root-key usb]   PIN (set if none), resident ES256 ssh:p3sig-policy key
                              (PIN required), delegated with the root from the vault stick.

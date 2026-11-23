@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# BUILDER/CI ONLY (task #2831): owners and customers never run this. Everything a person does is a
+# `p3sig` subcommand (old VeraCrypt sticks: `p3sig usb migrate`; checks: `p3sig doctor`; dongle: `p3sig dongle pair`).
 # SUPERSEDED (task #2630): use `p3sig dongle add` + `--with dongle` (the binary asks the PIN and touch itself, no ssh-agent).
 # dongle-agent.sh — run an ssh-agent holding the FIDO dongle's policy key, with
 # the dongle PIN asked in THIS terminal (ssh-agent has no tty, so a PIN-required

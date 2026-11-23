@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# BUILDER/CI ONLY (task #2831): owners and customers never run this. Everything a person does is a
+# `p3sig` subcommand (old VeraCrypt sticks: `p3sig usb migrate`; checks: `p3sig doctor`; dongle: `p3sig dongle pair`).
 # SUPERSEDED (task #2630): use `p3sig usb init` + `p3sig usb clone`.
 # make-vault-usbs.sh — turn two blank USB drives into the p3sig vault pair:
 # DAILY (carry) and SAFE (disaster recovery). Each gets a VeraCrypt container
