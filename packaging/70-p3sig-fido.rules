@@ -1,3 +1,5 @@
 # p3sig: let members of plugdev talk to FIDO2 dongles (p3sig dongle add, --with dongle).
 # Without it, on a box with no desktop login the uaccess ACL goes to gdm, not to you.
 KERNEL=="hidraw*", ENV{ID_FIDO_TOKEN}=="1", GROUP="plugdev", MODE="0660"
+# p3sig's own dongle firmware: the USB pairing port (p3sig dongle pair / unpair).
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2fe3", ATTRS{idProduct}=="0100", ATTRS{product}=="p3sig dongle", GROUP="plugdev", MODE="0660"

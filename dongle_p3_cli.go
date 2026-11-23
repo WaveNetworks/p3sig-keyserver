@@ -2,7 +2,7 @@ package main
 
 // dongle_p3_cli.go — `--with dongle` on our own dongle firmware (task #2628).
 //
-//	p3sig dongle pair --ble AA:BB:CC:DD:EE:FF[/random] --unlock-out PATH [--usb PATH]
+//	p3sig dongle pair --unlock-out PATH [--ble AA:BB:CC:DD:EE:FF[/random]] [--usb PATH]
 //	                  [--import VAULTKEY] [--root-key usb|…] [--expires 365d]
 //	p3sig dongle status
 //	p3sig dongle unpair [--usb PATH]      (press the dongle button first)
@@ -114,8 +114,19 @@ func writeSecretFile(path string, data []byte) error {
 // p3Pair runs USB PAIR and saves the record + unlock key BEFORE anything else
 // can fail (save before test): a delegation error must not cost the pairing.
 func p3Pair(usb DongleLink, ble, unlockOut string, seed *[32]byte) (*DonglePairing, error) {
-	if ble == "" || unlockOut == "" {
-		return nil, errors.New("usage: p3sig dongle pair --ble AA:BB:CC:DD:EE:FF[/random] --unlock-out PATH (the phone or the vault stick, not this disk's config dir)")
+	if unlockOut == "" {
+		return nil, errors.New("usage: p3sig dongle pair --unlock-out PATH [--ble AA:BB:CC:DD:EE:FF[/random]] (PATH: the phone or the vault stick, not this disk's config dir)")
+	}
+	if ble == "" {
+		// The dongle advertises only once paired, so ask it over USB first.
+		_, addr, err := DongleP3Info(usb)
+		if err != nil {
+			return nil, err
+		}
+		if addr == "" {
+			return nil, errors.New("this dongle firmware does not report its BLE address: pass --ble AA:BB:CC:DD:EE:FF[/random] (or update the firmware)")
+		}
+		ble = addr
 	}
 	if _, _, err := parseBLEAddr(ble); err != nil {
 		return nil, err
@@ -146,6 +157,7 @@ func p3Pair(usb DongleLink, ble, unlockOut string, seed *[32]byte) (*DonglePairi
 	if err != nil {
 		return nil, err
 	}
+	p.BLE = ble
 	abs, _ := filepath.Abs(unlockOut)
 	rec := p3Record{
 		HostSK:       base64.StdEncoding.EncodeToString(hostSK[:]),
@@ -315,10 +327,10 @@ func cmdDongleP3(sub string, f map[string]string) error {
 		}
 		pub, _ := ssh.NewPublicKey(p.VaultEd)
 		line := authorizedKey(pub)
-		fmt.Printf("paired: vault key %s\nunlock key written to %s (keep it off this disk)\n", ssh.FingerprintSHA256(pub), f["unlock-out"])
+		fmt.Printf("paired: vault key %s, BLE %s\nunlock key written to %s (keep it off this disk)\n", ssh.FingerprintSHA256(pub), p.BLE, f["unlock-out"])
 		if err := cmdPolicy("delegate", map[string]string{
 			"root-key": firstNonEmpty(f["root-key"], "usb"), "device": line,
-			"label": "p3sig dongle " + f["ble"], "expires": f["expires"],
+			"label": "p3sig dongle " + p.BLE, "expires": f["expires"],
 			"api": f["api"], "key": f["key"], "account": f["account"],
 		}); err != nil {
 			return fmt.Errorf("paired, but delegation failed (%v); retry with: p3sig policy delegate --root-key usb --device '%s'", err, line)
@@ -363,5 +375,5 @@ func cmdDongleP3(sub string, f map[string]string) error {
 		fmt.Println("dongle unpaired; revoke its key with `p3sig policy revoke --device SHA256:…`")
 		return nil
 	}
-	return errors.New("usage: p3sig dongle add | pair --ble ADDR --unlock-out PATH [--usb PATH] [--import VAULTKEY] | status | unpair | rekey [--unlock-out NEW_PATH] [--new-host-key]")
+	return errors.New("usage: p3sig dongle add | pair --unlock-out PATH [--ble ADDR] [--usb PATH] [--import VAULTKEY] | status | unpair | rekey [--unlock-out NEW_PATH] [--new-host-key]")
 }

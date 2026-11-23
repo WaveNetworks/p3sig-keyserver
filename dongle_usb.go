@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -91,6 +92,17 @@ func findDongleSerial(explicit string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
 	}
+	hits := dongleSerialCandidates()
+	switch len(hits) {
+	case 0:
+		return "", errors.New("dongle: no p3sig dongle on USB (plug it in, or pass --usb PATH)")
+	case 1:
+		return hits[0], nil
+	}
+	return "", fmt.Errorf("dongle: %d candidate USB devices %v; pass --usb PATH", len(hits), hits)
+}
+
+func dongleSerialCandidates() []string {
 	var hits []string
 	ents, _ := filepath.Glob("/dev/serial/by-id/*")
 	for _, e := range ents {
@@ -102,28 +114,71 @@ func findDongleSerial(explicit string) (string, error) {
 	if mac, _ := filepath.Glob("/dev/cu.usbmodem*"); len(hits) == 0 && len(mac) == 1 {
 		hits = mac
 	}
-	switch len(hits) {
-	case 0:
-		return "", errors.New("dongle: no p3sig dongle on USB (plug it in, or pass --dongle-usb PATH)")
-	case 1:
-		return hits[0], nil
-	}
-	return "", fmt.Errorf("dongle: %d candidate USB devices %v; pass --dongle-usb PATH", len(hits), hits)
+	return hits
 }
 
-// OpenDongleUSB opens the dongle's CDC ACM port in raw mode.
-func OpenDongleUSB(path string) (DongleLink, io.Closer, error) {
-	p, err := findDongleSerial(path)
-	if err != nil {
-		return nil, nil, err
+// udevRuleTTY is shipped in the deb/rpm too (packaging/70-p3sig-fido.rules).
+const udevRuleTTY = `SUBSYSTEM=="tty", ATTRS{idVendor}=="2fe3", ATTRS{idProduct}=="0100", ATTRS{product}=="p3sig dongle", GROUP="plugdev", MODE="0660"`
+
+func ttyHint(p string, err error) error {
+	if runtime.GOOS != "linux" || !errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("dongle: open %s: %w", p, err)
 	}
+	return fmt.Errorf("dongle: open %s: %w\n\nThe dongle's USB port is not writable by you. Fix (once, as root):\n"+
+		"  echo '%s' >> /etc/udev/rules.d/70-p3sig-fido.rules\n"+
+		"  udevadm control --reload && udevadm trigger\n"+
+		"  usermod -aG plugdev $USER   # then log in again", p, err, udevRuleTTY)
+}
+
+// openCDC opens one port in raw mode.
+func openCDC(p string, timeout time.Duration) (*cdcLink, *os.File, error) {
 	f, err := os.OpenFile(p, os.O_RDWR, 0)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dongle: open %s: %w", p, err)
+		return nil, nil, ttyHint(p, err)
 	}
 	if err := serialRaw(f); err != nil {
 		f.Close()
 		return nil, nil, fmt.Errorf("dongle: raw mode on %s: %w", p, err)
 	}
-	return &cdcLink{rw: f}, f, nil
+	return &cdcLink{rw: f, timeout: timeout}, f, nil
+}
+
+// probeCDC: the port answers an INFO frame the way our firmware does. The
+// first image on the hardware (2026-11-23) also enumerated the board's console
+// port (if00 beside the pairing port if02); that one never answers.
+func probeCDC(p string) bool {
+	l, f, err := openCDC(p, 1500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	r, err := l.Exchange([]byte{p3OpInfo})
+	return err == nil && len(r) >= 2 && r[0] == 0
+}
+
+// OpenDongleUSB opens the dongle's CDC ACM port in raw mode. With several
+// candidate ports (a dongle exposing more than one), the one that answers
+// INFO is the pairing port.
+func OpenDongleUSB(path string) (DongleLink, io.Closer, error) {
+	p, err := findDongleSerial(path)
+	if err != nil && path == "" {
+		var answering []string
+		for _, c := range dongleSerialCandidates() {
+			if probeCDC(c) {
+				answering = append(answering, c)
+			}
+		}
+		if len(answering) != 1 {
+			return nil, nil, err
+		}
+		p, err = answering[0], nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	l, f, err := openCDC(p, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return l, f, nil
 }

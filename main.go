@@ -776,7 +776,7 @@ VAULT STICKS + DONGLE (setup in 3 commands; no VeraCrypt, no sudo, no ssh-agent)
   p3sig usb clone [--drive FROM] [--to PATH]   Copy a vault stick to another blank stick.
   p3sig dongle add [--root-key usb]   PIN (set if none), resident ES256 ssh:p3sig-policy key
                              (PIN required), delegated with the root from the vault stick.
-  p3sig dongle pair --ble ADDR --unlock-out PATH [--usb PATH] [--import VAULTKEY] [--root-key usb]
+  p3sig dongle pair --unlock-out PATH [--ble ADDR] [--usb PATH] [--import VAULTKEY] [--root-key usb]
                              Our own firmware: USB pairing, unlock key to PATH (phone/vault stick,
                              not this disk), vault Ed25519 key delegated. Then --with dongle signs
                              over BLE. p3sig dongle status | unpair (button press).

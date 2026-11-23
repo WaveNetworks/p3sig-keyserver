@@ -181,6 +181,28 @@ func TestDongleP3EndToEnd(t *testing.T) {
 	}
 }
 
+// pair without --ble: the dongle reports its address over USB (INFO).
+func TestDongleP3PairReadsBLE(t *testing.T) {
+	d := startSim(t)
+	dir := t.TempDir()
+	t.Setenv("P3SIG_DONGLE_RECORD", dir+"/cfg/dongle-p3.json")
+	paired, ble, err := DongleP3Info(simLink{d, 'U'})
+	if err != nil || paired || ble != "F4:3C:F2:2D:2A:DC/random" {
+		t.Fatalf("INFO before pairing: %v %q %v", paired, ble, err)
+	}
+	p, err := p3Pair(simLink{d, 'U'}, "", dir+"/phone/unlock.key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := loadP3Record()
+	if p.BLE != ble || rec.BLE != ble {
+		t.Fatalf("record BLE %q", rec.BLE)
+	}
+	if paired, ble2, err := DongleP3Info(simLink{d, 'U'}); err != nil || !paired || ble2 != ble {
+		t.Fatalf("INFO after pairing: %v %q %v", paired, ble2, err)
+	}
+}
+
 // `--with dongle` on our firmware: pair over USB (record + unlock key saved
 // apart), then loadDongleSigner signs over "BLE" and ssh verifies it.
 func TestDongleP3WithDongle(t *testing.T) {

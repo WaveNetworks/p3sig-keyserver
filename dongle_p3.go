@@ -215,6 +215,41 @@ type DonglePairing struct {
 	DongleStatic [32]byte          // pinned Noise static of the dongle
 	VaultEd      ed25519.PublicKey // the vault signing key (delegate this)
 	VaultX       [32]byte          // the vault X25519 key (secrets seal to it)
+	BLE          string            // the address it advertises on (p3Pair fills it)
+}
+
+// DongleP3Info asks over USB whether the dongle is paired and, from firmware that
+// reports it, the BLE address it advertises on ("AA:BB:CC:DD:EE:FF/random").
+func DongleP3Info(usb DongleLink) (paired bool, ble string, err error) {
+	r, err := usb.Exchange([]byte{p3OpInfo})
+	if err != nil {
+		return false, "", err
+	}
+	if len(r) < 2 || r[0] != 0 {
+		if len(r) < 1 {
+			return false, "", errors.New("dongle: empty reply")
+		}
+		return false, "", p3Err(r[0])
+	}
+	paired = r[1] == 1
+	base := 2
+	if paired {
+		base = 66
+	}
+	switch len(r) {
+	case base:
+	case base + 7:
+		a := r[base : base+6] // bt_addr_t: little-endian
+		ble = fmt.Sprintf("%02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0])
+		if r[base+6] == 0 {
+			ble += "/public"
+		} else {
+			ble += "/random"
+		}
+	default:
+		return false, "", fmt.Errorf("dongle: INFO reply is %d bytes", len(r))
+	}
+	return paired, ble, nil
 }
 
 // DonglePair: seed nil = the dongle generates the vault key; otherwise it
